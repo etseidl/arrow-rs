@@ -41,7 +41,7 @@ mod dict_encoder;
 /// values, caller should call `flush_buffer()` to get an immutable buffer pointer.
 pub trait Encoder<T: DataType>: Send {
     /// Encodes data from `values`.
-    fn put(&mut self, values: &[T::T]) -> Result<()>;
+     fn put(&mut self, values: &[T::T]) -> Result<()>;
 
     /// Encodes data from `values`, which contains spaces for null values, that is
     /// identified by `valid_bits`.
@@ -52,11 +52,7 @@ pub trait Encoder<T: DataType>: Send {
         let num_values = values.len();
         let mut buffer = Vec::with_capacity(num_values);
         // TODO: this is pretty inefficient. Revisit in future.
-        for (i, item) in values.iter().enumerate().take(num_values) {
-            if crate::util::bit_util::get_bit(valid_bits, i) {
-                buffer.push(item.clone());
-            }
-        }
+        for (i, item) in values.iter().enumerate().take(num_values) { if crate::util::bit_util::get_bit(valid_bits, i) { buffer.push(item.clone()); } }
         self.put(&buffer[..])?;
         Ok(buffer.len())
     }
