@@ -71,7 +71,7 @@ impl Args {
             .iter()
             .map(|x| {
                 let reader = File::open(x)?;
-                let metadata = ParquetMetaDataReader::new().parse(&reader)?;
+                let metadata = ParquetMetaDataReader::new().parse_and_finish(&reader)?;
                 Ok((reader, metadata))
             })
             .collect::<Result<Vec<_>>>()?;

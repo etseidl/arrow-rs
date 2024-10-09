@@ -80,7 +80,7 @@ struct Page {
 }
 
 fn do_layout<C: ChunkReader>(reader: &C) -> Result<ParquetFile> {
-    let metadata = ParquetMetaDataReader::new().parse(reader)?;
+    let metadata = ParquetMetaDataReader::new().parse_and_finish(reader)?;
     let schema = metadata.file_metadata().schema_descr();
 
     let row_groups = (0..metadata.num_row_groups())

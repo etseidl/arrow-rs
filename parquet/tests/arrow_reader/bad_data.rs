@@ -150,13 +150,13 @@ async fn bad_metadata_err() {
     let mut loader = ParquetMetaDataReader::new();
     loader.try_load(&mut reader, metadata_length).await.unwrap();
     loader = loader.with_page_indexes(false);
-    loader.load_page_index(&mut reader, None).await.unwrap();
+    loader.load_page_index(&mut reader).await.unwrap();
 
     loader = loader.with_offset_indexes(true);
-    loader.load_page_index(&mut reader, None).await.unwrap();
+    loader.load_page_index(&mut reader).await.unwrap();
 
     loader = loader.with_column_indexes(true);
-    let err = loader.load_page_index(&mut reader, None).await.unwrap_err();
+    let err = loader.load_page_index(&mut reader).await.unwrap_err();
 
     assert_eq!(
         err.to_string(),

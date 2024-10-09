@@ -124,13 +124,14 @@ impl AsyncFileReader for ParquetObjectReader {
 
     fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>>> {
         Box::pin(async move {
-            let mut reader = ParquetMetaDataReader::new()
+            let file_size = self.meta.size;
+            let metadata = ParquetMetaDataReader::new()
                 .with_column_indexes(self.preload_column_index)
                 .with_offset_indexes(self.preload_offset_index)
-                .with_prefetch_hint(self.metadata_size_hint);
-            let file_size = self.meta.size;
-            reader.try_load(self, file_size).await?;
-            Ok(Arc::new(reader.finish()?))
+                .with_prefetch_hint(self.metadata_size_hint)
+                .load_and_finish(self, file_size)
+                .await?;
+            Ok(Arc::new(metadata))
         })
     }
 }

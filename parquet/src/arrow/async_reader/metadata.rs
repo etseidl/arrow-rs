@@ -28,7 +28,44 @@ use std::future::Future;
 use std::ops::Range;
 
 /// A data source that can be used with [`MetadataLoader`] to load [`ParquetMetaData`]
+///
+/// Note that implementation is provided for [`AsyncFileReader`].
+///
+/// # Example `MetadataFetch` for a custom async data source
+///
+/// ```rust
+/// # use parquet::errors::Result;
+/// # use parquet::arrow::async_reader::MetadataFetch;
+/// # use bytes::Bytes;
+/// # use std::ops::Range;
+/// # use std::io::SeekFrom;
+/// # use futures::future::BoxFuture;
+/// # use futures::FutureExt;
+/// # use tokio::io::{AsyncReadExt, AsyncSeekExt};
+/// // Adapter that implements the API for reading bytes from an async source (in
+/// // this case a tokio::fs::File)
+/// struct TokioFileMetadata {
+///     file: tokio::fs::File,
+/// }
+/// impl MetadataFetch for TokioFileMetadata {
+///     fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
+///         // return a future that fetches data in range
+///         async move {
+///             let mut buf = vec![0; range.len()]; // target buffer
+///             // seek to the start of the range and read the data
+///             self.file.seek(SeekFrom::Start(range.start as u64)).await?;
+///             self.file.read_exact(&mut buf).await?;
+///             Ok(Bytes::from(buf)) // convert to Bytes
+///         }
+///             .boxed() // turn into BoxedFuture, using FutureExt::boxed
+///     }
+/// }
+///```
 pub trait MetadataFetch {
+    /// Return a future that fetches the specified range of bytes asynchronously
+    ///
+    /// Note the returned type is a boxed future, often created by
+    /// [FutureExt::boxed]. See the trait documentation for an example
     fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>>;
 }
 
@@ -52,6 +89,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     /// Create a new [`MetadataLoader`] by reading the footer information
     ///
     /// See [`fetch_parquet_metadata`] for the meaning of the individual parameters
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub async fn load(mut fetch: F, file_size: usize, prefetch: Option<usize>) -> Result<Self> {
         if file_size < FOOTER_SIZE {
             return Err(ParquetError::EOF(format!(
@@ -108,6 +146,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     }
 
     /// Create a new [`MetadataLoader`] from an existing [`ParquetMetaData`]
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub fn new(fetch: F, metadata: ParquetMetaData) -> Self {
         Self {
             fetch,
@@ -120,6 +159,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     ///
     /// * `column_index`: if true will load column index
     /// * `offset_index`: if true will load offset index
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub async fn load_page_index(&mut self, column_index: bool, offset_index: bool) -> Result<()> {
         if !column_index && !offset_index {
             return Ok(());
@@ -226,6 +266,7 @@ where
 /// in the first request, instead of 8, and only issue further requests
 /// if additional bytes are needed. Providing a `prefetch` hint can therefore
 /// significantly reduce the number of `fetch` requests, and consequently latency
+#[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
 pub async fn fetch_parquet_metadata<F, Fut>(
     fetch: F,
     file_size: usize,
@@ -236,11 +277,14 @@ where
     Fut: Future<Output = Result<Bytes>> + Send,
 {
     let fetch = MetadataFetchFn(fetch);
-    let mut reader = ParquetMetaDataReader::new().with_prefetch_hint(prefetch);
-    reader.try_load(fetch, file_size).await?;
-    reader.finish()
+    ParquetMetaDataReader::new()
+        .with_prefetch_hint(prefetch)
+        .load_and_finish(fetch, file_size)
+        .await
 }
 
+// these tests are all replicated in parquet::file::metadata::reader
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;

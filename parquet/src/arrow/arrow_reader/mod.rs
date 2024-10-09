@@ -382,7 +382,7 @@ impl ArrowReaderMetadata {
     pub fn load<T: ChunkReader>(reader: &T, options: ArrowReaderOptions) -> Result<Self> {
         let metadata = ParquetMetaDataReader::new()
             .with_page_indexes(options.page_index)
-            .parse(reader)?;
+            .parse_and_finish(reader)?;
         Self::try_new(Arc::new(metadata), options)
     }
 
@@ -3480,8 +3480,11 @@ mod tests {
                 ArrowReaderOptions::new().with_page_index(true),
             )
             .unwrap();
-            // Absent page indexes should not be initialized, and file should still be readable.
-            assert!(builder.metadata().offset_index().is_none());
+            // Although `Vec<Vec<PageLoacation>>` of each row group is empty,
+            // we should read the file successfully.
+            // FIXME: this test will fail when metadata parsing returns `None` for missing page
+            // indexes. https://github.com/apache/arrow-rs/issues/6447
+            assert!(builder.metadata().offset_index().unwrap()[0].is_empty());
             let reader = builder.build().unwrap();
             let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
             assert_eq!(batches.len(), 1);
