@@ -178,7 +178,7 @@ impl ParquetMetaDataReader {
     ///
     /// # Errors
     ///
-    /// This function will return [`ParquetError::IndexOutOfBound`] in the event `reader` does not
+    /// This function will return [`ParquetError::NeedMoreData`] in the event `reader` does not
     /// provide enough data to fully parse the metadata (see example below).
     ///
     /// Other errors returned include [`ParquetError::General`] and [`ParquetError::EOF`].
@@ -207,11 +207,6 @@ impl ParquetMetaDataReader {
     pub fn try_parse_sized<R: ChunkReader>(&mut self, reader: &R, file_size: usize) -> Result<()> {
         self.metadata = match self.parse_metadata(reader) {
             Ok(metadata) => Some(metadata),
-            // FIXME: throughout this module ParquetError::IndexOutOfBound is used to indicate the
-            // need for more data. This is not it's intended use. The plan is to add a NeedMoreData
-            // value to the enum, but this would be a breaking change. This will be done as
-            // 54.0.0 draws nearer.
-            // https://github.com/apache/arrow-rs/issues/6447
             Err(ParquetError::NeedMoreData(needed)) => {
                 // If reader is the same length as `file_size` then presumably there is no more to
                 // read, so return an EOF error.
