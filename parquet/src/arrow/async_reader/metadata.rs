@@ -376,43 +376,41 @@ mod tests {
         };
 
         let f = MetadataFetchFn(&mut fetch);
-        let mut loader = ParquetMetaDataReader::new().with_page_indexes(true);
-        loader.try_load(f, len).await.unwrap();
+        let mut loader = MetadataLoader::load(f, len, None).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
+        loader.load_page_index(true, true).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 3);
-        let metadata = loader.finish().unwrap();
+        let metadata = loader.finish();
         assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
 
         // Prefetch just footer exactly
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
-        let mut loader = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
-            .with_prefetch_hint(Some(1729));
-        loader.try_load(f, len).await.unwrap();
+        let mut loader = MetadataLoader::load(f, len, Some(1729)).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        loader.load_page_index(true, true).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
-        let metadata = loader.finish().unwrap();
+        let metadata = loader.finish();
         assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
 
         // Prefetch more than footer but not enough
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
-        let mut loader = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
-            .with_prefetch_hint(Some(130649));
-        loader.try_load(f, len).await.unwrap();
+        let mut loader = MetadataLoader::load(f, len, Some(130649)).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        loader.load_page_index(true, true).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
-        let metadata = loader.finish().unwrap();
+        let metadata = loader.finish();
         assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
 
         // Prefetch exactly enough
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
-        let mut loader = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
-            .with_prefetch_hint(Some(130650));
-        loader.try_load(f, len).await.unwrap();
+        let mut loader = MetadataLoader::load(f, len, Some(130650)).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
-        let metadata = loader.finish().unwrap();
+        loader.load_page_index(true, true).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        let metadata = loader.finish();
         assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
     }
 }

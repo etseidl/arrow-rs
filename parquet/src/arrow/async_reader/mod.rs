@@ -959,10 +959,6 @@ mod tests {
         }
     }
 
-    fn get_parquet_metadata(data: &Bytes) -> ParquetMetaData {
-        ParquetMetaDataReader::new().parse(data).unwrap()
-    }
-
     #[tokio::test]
     async fn test_async_reader() {
         let testdata = arrow::util::test_util::parquet_test_data();
