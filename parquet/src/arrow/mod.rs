@@ -270,6 +270,76 @@ mod test {
     }
 
     #[test]
+    fn test_metadata_read_write_clear_offsets() {
+        let parquet_bytes = create_parquet_file();
+
+        // read the metadata from the file WITHOUT the page index structures
+        let original_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // clear page index offsets/lengths
+        let mut builder = original_metadata.into_builder();
+        for row_group in builder.take_row_groups() {
+            let mut row_group_builder = row_group.into_builder();
+            for column in row_group_builder.take_columns() {
+                let column = column
+                    .into_builder()
+                    .set_column_index_length(None)
+                    .set_column_index_offset(None)
+                    .set_offset_index_length(None)
+                    .set_offset_index_offset(None)
+                    .build()
+                    .unwrap();
+                row_group_builder = row_group_builder.add_column_metadata(column);
+            }
+            let row_group = row_group_builder.build().unwrap();
+            builder = builder.add_row_group(row_group);
+        }
+        let original_metadata = builder.build();
+
+        // read metadata back from the serialized bytes
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&metadata_bytes)
+            .unwrap();
+
+        assert_eq!(original_metadata, roundtrip_metadata);
+    }
+
+    #[test]
+    // An example of reading footer metadata from an external file, but
+    // page indexes from the original file.
+    fn test_metadata_read_write_partial_roundtrip() {
+        let parquet_bytes = create_parquet_file();
+
+        // read full metadata
+        let correct_metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read the metadata from the file WITHOUT the page index structures
+        let original_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read metadata back from the serialized bytes
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&metadata_bytes)
+            .unwrap();
+        assert_eq!(original_metadata, roundtrip_metadata);
+
+        // now retrieve page index from original file
+        let mut reader =
+            ParquetMetaDataReader::new_with_metadata(roundtrip_metadata).with_page_indexes(true);
+        reader.read_page_indexes(&parquet_bytes).unwrap();
+        let roundtrip_metadata = reader.finish().unwrap();
+        assert_eq!(correct_metadata, roundtrip_metadata);
+    }
+
+    #[test]
     fn test_metadata_read_write_roundtrip() {
         let parquet_bytes = create_parquet_file();
 
