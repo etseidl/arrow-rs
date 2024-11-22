@@ -493,6 +493,11 @@ impl<OffsetSize: OffsetSizeTrait> Array for GenericListArray<OffsetSize> {
         self.nulls.as_ref()
     }
 
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
+    }
+
     fn get_buffer_memory_size(&self) -> usize {
         let mut size = self.values.get_buffer_memory_size();
         size += self.value_offsets.inner().inner().capacity();
@@ -512,7 +517,7 @@ impl<OffsetSize: OffsetSizeTrait> Array for GenericListArray<OffsetSize> {
     }
 }
 
-impl<'a, OffsetSize: OffsetSizeTrait> ArrayAccessor for &'a GenericListArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> ArrayAccessor for &GenericListArray<OffsetSize> {
     type Item = ArrayRef;
 
     fn value(&self, index: usize) -> Self::Item {
@@ -549,7 +554,7 @@ pub type LargeListArray = GenericListArray<i64>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::{FixedSizeListBuilder, Int32Builder, ListBuilder};
+    use crate::builder::{FixedSizeListBuilder, Int32Builder, ListBuilder, UnionBuilder};
     use crate::cast::AsArray;
     use crate::types::Int32Type;
     use crate::{Int32Array, Int64Array};
@@ -1180,5 +1185,19 @@ mod tests {
             .map(|x| x.map(|x| x.as_primitive::<Int32Type>().values().to_vec()))
             .collect();
         assert_eq!(values, vec![Some(vec![1, 2, 3]), None, Some(vec![4, 5, 6])])
+    }
+
+    #[test]
+    fn test_nullable_union() {
+        let offsets = OffsetBuffer::new(vec![0, 1, 4, 5].into());
+        let mut builder = UnionBuilder::new_dense();
+        builder.append::<Int32Type>("a", 1).unwrap();
+        builder.append::<Int32Type>("b", 2).unwrap();
+        builder.append::<Int32Type>("b", 3).unwrap();
+        builder.append::<Int32Type>("a", 4).unwrap();
+        builder.append::<Int32Type>("a", 5).unwrap();
+        let values = builder.build().unwrap();
+        let field = Arc::new(Field::new("element", values.data_type().clone(), false));
+        ListArray::new(field.clone(), offsets, Arc::new(values), None);
     }
 }

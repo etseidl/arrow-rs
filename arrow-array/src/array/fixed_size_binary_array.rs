@@ -610,6 +610,11 @@ impl Array for FixedSizeBinaryArray {
         self.nulls.as_ref()
     }
 
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
+    }
+
     fn get_buffer_memory_size(&self) -> usize {
         let mut sum = self.value_data.capacity();
         if let Some(n) = &self.nulls {
@@ -858,6 +863,7 @@ mod tests {
         let array = FixedSizeBinaryArray::from(values);
         assert_eq!(array.len(), 4);
         assert_eq!(array.null_count(), 0);
+        assert_eq!(array.logical_null_count(), 0);
         assert_eq!(array.value(0), b"one");
         assert_eq!(array.value(1), b"two");
         assert_eq!(array.value(2), b"six");

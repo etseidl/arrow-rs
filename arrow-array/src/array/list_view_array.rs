@@ -285,7 +285,7 @@ impl<OffsetSize: OffsetSizeTrait> GenericListViewArray<OffsetSize> {
     }
 }
 
-impl<'a, OffsetSize: OffsetSizeTrait> ArrayAccessor for &'a GenericListViewArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> ArrayAccessor for &GenericListViewArray<OffsetSize> {
     type Item = ArrayRef;
 
     fn value(&self, index: usize) -> Self::Item {
@@ -332,6 +332,11 @@ impl<OffsetSize: OffsetSizeTrait> Array for GenericListViewArray<OffsetSize> {
 
     fn nulls(&self) -> Option<&NullBuffer> {
         self.nulls.as_ref()
+    }
+
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
     }
 
     fn get_buffer_memory_size(&self) -> usize {

@@ -76,6 +76,8 @@ mod list_view_array;
 
 pub use list_view_array::*;
 
+use crate::iterator::ArrayIter;
+
 /// An array in the [arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
 pub trait Array: std::fmt::Debug + Send + Sync {
     /// Returns the array as [`Any`] so that it can be
@@ -279,17 +281,43 @@ pub trait Array: std::fmt::Debug + Send + Sync {
         self.nulls().map(|n| n.null_count()).unwrap_or_default()
     }
 
+    /// Returns the total number of logical null values in this array.
+    ///
+    /// Note: this method returns the logical null count, i.e. that encoded in
+    /// [`Array::logical_nulls`]. In general this is equivalent to [`Array::null_count`] but may differ in the
+    /// presence of logical nullability, see [`Array::nulls`] and [`Array::logical_nulls`].
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use arrow_array::{Array, Int32Array};
+    ///
+    /// // Construct an array with values [1, NULL, NULL]
+    /// let array = Int32Array::from(vec![Some(1), None, None]);
+    ///
+    /// assert_eq!(array.logical_null_count(), 2);
+    /// ```
+    fn logical_null_count(&self) -> usize {
+        self.logical_nulls()
+            .map(|n| n.null_count())
+            .unwrap_or_default()
+    }
+
     /// Returns `false` if the array is guaranteed to not contain any logical nulls
     ///
-    /// In general this will be equivalent to `Array::null_count() != 0` but may differ in the
-    /// presence of logical nullability, see [`Array::logical_nulls`].
+    /// This is generally equivalent to `Array::logical_null_count() != 0` unless determining
+    /// the logical nulls is expensive, in which case this method can return true even for an
+    /// array without nulls.
+    ///
+    /// This is also generally equivalent to `Array::null_count() != 0` but may differ in the
+    /// presence of logical nullability, see [`Array::logical_null_count`] and [`Array::null_count`].
     ///
     /// Implementations will return `true` unless they can cheaply prove no logical nulls
     /// are present. For example a [`DictionaryArray`] with nullable values will still return true,
     /// even if the nulls present in [`DictionaryArray::values`] are not referenced by any key,
     /// and therefore would not appear in [`Array::logical_nulls`].
     fn is_nullable(&self) -> bool {
-        self.null_count() != 0
+        self.logical_null_count() != 0
     }
 
     /// Returns the total number of bytes of memory pointed to by this array.
@@ -361,6 +389,10 @@ impl Array for ArrayRef {
         self.as_ref().null_count()
     }
 
+    fn logical_null_count(&self) -> usize {
+        self.as_ref().logical_null_count()
+    }
+
     fn is_nullable(&self) -> bool {
         self.as_ref().is_nullable()
     }
@@ -374,7 +406,7 @@ impl Array for ArrayRef {
     }
 }
 
-impl<'a, T: Array> Array for &'a T {
+impl<T: Array> Array for &T {
     fn as_any(&self) -> &dyn Any {
         T::as_any(self)
     }
@@ -425,6 +457,10 @@ impl<'a, T: Array> Array for &'a T {
 
     fn null_count(&self) -> usize {
         T::null_count(self)
+    }
+
+    fn logical_null_count(&self) -> usize {
+        T::logical_null_count(self)
     }
 
     fn is_nullable(&self) -> bool {
@@ -535,6 +571,40 @@ pub trait ArrayAccessor: Array {
     unsafe fn value_unchecked(&self, index: usize) -> Self::Item;
 }
 
+/// A trait for Arrow String Arrays, currently three types are supported:
+/// - `StringArray`
+/// - `LargeStringArray`
+/// - `StringViewArray`
+///
+/// This trait helps to abstract over the different types of string arrays
+/// so that we don't need to duplicate the implementation for each type.
+pub trait StringArrayType<'a>: ArrayAccessor<Item = &'a str> + Sized {
+    /// Returns true if all data within this string array is ASCII
+    fn is_ascii(&self) -> bool;
+
+    /// Constructs a new iterator
+    fn iter(&self) -> ArrayIter<Self>;
+}
+
+impl<'a, O: OffsetSizeTrait> StringArrayType<'a> for &'a GenericStringArray<O> {
+    fn is_ascii(&self) -> bool {
+        GenericStringArray::<O>::is_ascii(self)
+    }
+
+    fn iter(&self) -> ArrayIter<Self> {
+        GenericStringArray::<O>::iter(self)
+    }
+}
+impl<'a> StringArrayType<'a> for &'a StringViewArray {
+    fn is_ascii(&self) -> bool {
+        StringViewArray::is_ascii(self)
+    }
+
+    fn iter(&self) -> ArrayIter<Self> {
+        StringViewArray::iter(self)
+    }
+}
+
 impl PartialEq for dyn Array + '_ {
     fn eq(&self, other: &Self) -> bool {
         self.to_data().eq(&other.to_data())
@@ -614,6 +684,12 @@ impl PartialEq for FixedSizeListArray {
 }
 
 impl PartialEq for StructArray {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_data().eq(&other.to_data())
+    }
+}
+
+impl<T: ByteViewType + ?Sized> PartialEq for GenericByteViewArray<T> {
     fn eq(&self, other: &Self) -> bool {
         self.to_data().eq(&other.to_data())
     }
@@ -959,11 +1035,13 @@ mod tests {
             let array = as_union_array(array.as_ref());
             assert_eq!(array.len(), 4);
             assert_eq!(array.null_count(), 0);
+            assert_eq!(array.logical_null_count(), 4);
 
             for i in 0..4 {
                 let a = array.value(i);
                 assert_eq!(a.len(), 1);
                 assert_eq!(a.null_count(), 1);
+                assert_eq!(a.logical_null_count(), 1);
                 assert!(a.is_null(0))
             }
 
@@ -987,6 +1065,7 @@ mod tests {
                 array => {
                     assert_eq!(array.len(), 4);
                     assert_eq!(array.null_count(), 0);
+                    assert_eq!(array.logical_null_count(), 4);
                     assert_eq!(array.values().len(), 1);
                     assert_eq!(array.values().null_count(), 1);
                     assert_eq!(array.run_ends().len(), 4);
@@ -1012,6 +1091,7 @@ mod tests {
 
             assert_eq!(array.len(), 6);
             assert_eq!(array.null_count(), 6);
+            assert_eq!(array.logical_null_count(), 6);
             array.iter().for_each(|x| assert!(x.is_none()));
         }
     }
