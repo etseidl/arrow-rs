@@ -1410,14 +1410,6 @@ pub struct ColumnIndexBuilder {
     repetition_level_histograms: Option<Vec<i64>>,
     /// contains the concatenation of the histograms of all pages
     definition_level_histograms: Option<Vec<i64>>,
-    /// Is the information in the builder valid?
-    ///
-    /// Set to `false` if any entry in the page doesn't have statistics for
-    /// some reason, so statistics for that page won't be written to the file.
-    /// This might happen if the page is entirely null, or
-    /// is a floating point column without any non-nan values
-    /// e.g. <https://github.com/apache/parquet-format/pull/196>
-    valid: bool,
 }
 
 impl Default for ColumnIndexBuilder {
@@ -1437,7 +1429,6 @@ impl ColumnIndexBuilder {
             boundary_order: BoundaryOrder::UNORDERED,
             repetition_level_histograms: None,
             definition_level_histograms: None,
-            valid: true,
         }
     }
 
@@ -1462,9 +1453,6 @@ impl ColumnIndexBuilder {
         repetition_level_histogram: &Option<LevelHistogram>,
         definition_level_histogram: &Option<LevelHistogram>,
     ) {
-        if !self.valid {
-            return;
-        }
         if let Some(ref rep_lvl_hist) = repetition_level_histogram {
             let hist = self.repetition_level_histograms.get_or_insert(Vec::new());
             hist.reserve(rep_lvl_hist.len());
@@ -1480,16 +1468,6 @@ impl ColumnIndexBuilder {
     /// Set the boundary order of the column index
     pub fn set_boundary_order(&mut self, boundary_order: BoundaryOrder) {
         self.boundary_order = boundary_order;
-    }
-
-    /// Mark this column index as invalid
-    pub fn to_invalid(&mut self) {
-        self.valid = false;
-    }
-
-    /// Is the information in the builder valid?
-    pub fn valid(&self) -> bool {
-        self.valid
     }
 
     /// Build and get the thrift metadata of column index

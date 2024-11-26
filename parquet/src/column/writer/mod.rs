@@ -346,7 +346,7 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     rep_levels_sink: Vec<i16>,
     data_pages: VecDeque<CompressedPage>,
     // column index and offset index
-    column_index_builder: ColumnIndexBuilder,
+    column_index_builder: Option<ColumnIndexBuilder>,
     offset_index_builder: OffsetIndexBuilder,
 
     // Below fields used to incrementally check boundary order across data pages.
@@ -389,10 +389,10 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         }
 
         // Disable column_index_builder if not collecting page statistics.
-        let mut column_index_builder = ColumnIndexBuilder::new();
-        if statistics_enabled != EnabledStatistics::Page {
-            column_index_builder.to_invalid()
-        }
+        let column_index_builder = match statistics_enabled {
+            EnabledStatistics::Page => Some(ColumnIndexBuilder::new()),
+            _ => None,
+        };
 
         Self {
             descr,
@@ -597,22 +597,21 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         let metadata = self.build_column_metadata()?;
         self.page_writer.close()?;
 
-        let boundary_order = match (
-            self.data_page_boundary_ascending,
-            self.data_page_boundary_descending,
-        ) {
-            // If the lists are composed of equal elements then will be marked as ascending
-            // (Also the case if all pages are null pages)
-            (true, _) => BoundaryOrder::ASCENDING,
-            (false, true) => BoundaryOrder::DESCENDING,
-            (false, false) => BoundaryOrder::UNORDERED,
-        };
-        self.column_index_builder.set_boundary_order(boundary_order);
+        if let Some(builder) = self.column_index_builder.as_mut() {
+            let boundary_order = match (
+                self.data_page_boundary_ascending,
+                self.data_page_boundary_descending,
+            ) {
+                // If the lists are composed of equal elements then will be marked as ascending
+                // (Also the case if all pages are null pages)
+                (true, _) => BoundaryOrder::ASCENDING,
+                (false, true) => BoundaryOrder::DESCENDING,
+                (false, false) => BoundaryOrder::UNORDERED,
+            };
+            builder.set_boundary_order(boundary_order);
+        }
 
-        let column_index = self
-            .column_index_builder
-            .valid()
-            .then(|| self.column_index_builder.build_to_thrift());
+        let column_index = self.column_index_builder.map(|b| b.build_to_thrift());
         let offset_index = Some(self.offset_index_builder.build_to_thrift());
 
         Ok(ColumnCloseResult {
@@ -764,81 +763,97 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         page_variable_length_bytes: Option<i64>,
     ) {
         // update the column index
-        let null_page =
-            (self.page_metrics.num_buffered_rows as u64) == self.page_metrics.num_page_nulls;
-        // a page contains only null values,
-        // and writers have to set the corresponding entries in min_values and max_values to byte[0]
-        if null_page && self.column_index_builder.valid() {
-            self.column_index_builder.append(
-                null_page,
-                vec![],
-                vec![],
-                self.page_metrics.num_page_nulls as i64,
-            );
-        } else if self.column_index_builder.valid() {
-            // from page statistics
-            // If can't get the page statistics, ignore this column/offset index for this column chunk
-            match &page_statistics {
-                None => {
-                    self.column_index_builder.to_invalid();
-                }
-                Some(stat) => {
-                    // Check if min/max are still ascending/descending across pages
-                    let new_min = stat.min_opt().unwrap();
-                    let new_max = stat.max_opt().unwrap();
-                    if let Some((last_min, last_max)) = &self.last_non_null_data_page_min_max {
-                        if self.data_page_boundary_ascending {
-                            // If last min/max are greater than new min/max then not ascending anymore
-                            let not_ascending = compare_greater(&self.descr, last_min, new_min)
-                                || compare_greater(&self.descr, last_max, new_max);
-                            if not_ascending {
-                                self.data_page_boundary_ascending = false;
-                            }
-                        }
-
-                        if self.data_page_boundary_descending {
-                            // If new min/max are greater than last min/max then not descending anymore
-                            let not_descending = compare_greater(&self.descr, new_min, last_min)
-                                || compare_greater(&self.descr, new_max, last_max);
-                            if not_descending {
-                                self.data_page_boundary_descending = false;
-                            }
-                        }
+        if self.column_index_builder.is_some() {
+            let null_page =
+                (self.page_metrics.num_buffered_rows as u64) == self.page_metrics.num_page_nulls;
+            // a page contains only null values,
+            // and writers have to set the corresponding entries in min_values and max_values to byte[0]
+            if null_page {
+                self.column_index_builder.as_mut().unwrap().append(
+                    null_page,
+                    vec![],
+                    vec![],
+                    self.page_metrics.num_page_nulls as i64,
+                );
+            } else {
+                // from page statistics
+                // Set builder to `None` if any entry in the page doesn't have statistics for
+                // some reason. This might happen if the page is entirely null, or
+                // is a floating point column without any non-nan values
+                // e.g. <https://github.com/apache/parquet-format/pull/196>
+                // If any page lacks statistics, then do not write the column index for this
+                // column chunk.
+                match &page_statistics {
+                    None => {
+                        self.column_index_builder = None;
                     }
-                    self.last_non_null_data_page_min_max = Some((new_min.clone(), new_max.clone()));
+                    Some(stat) => {
+                        // Check if min/max are still ascending/descending across pages
+                        let new_min = stat.min_opt().unwrap();
+                        let new_max = stat.max_opt().unwrap();
+                        if let Some((last_min, last_max)) = &self.last_non_null_data_page_min_max {
+                            if self.data_page_boundary_ascending {
+                                // If last min/max are greater than new min/max then not ascending anymore
+                                let not_ascending = compare_greater(&self.descr, last_min, new_min)
+                                    || compare_greater(&self.descr, last_max, new_max);
+                                if not_ascending {
+                                    self.data_page_boundary_ascending = false;
+                                }
+                            }
 
-                    if self.can_truncate_value() {
-                        self.column_index_builder.append(
-                            null_page,
-                            self.truncate_min_value(
-                                self.props.column_index_truncate_length(),
-                                stat.min_bytes_opt().unwrap(),
-                            )
-                            .0,
-                            self.truncate_max_value(
-                                self.props.column_index_truncate_length(),
-                                stat.max_bytes_opt().unwrap(),
-                            )
-                            .0,
-                            self.page_metrics.num_page_nulls as i64,
-                        );
-                    } else {
-                        self.column_index_builder.append(
-                            null_page,
-                            stat.min_bytes_opt().unwrap().to_vec(),
-                            stat.max_bytes_opt().unwrap().to_vec(),
-                            self.page_metrics.num_page_nulls as i64,
-                        );
+                            if self.data_page_boundary_descending {
+                                // If new min/max are greater than last min/max then not descending anymore
+                                let not_descending =
+                                    compare_greater(&self.descr, new_min, last_min)
+                                        || compare_greater(&self.descr, new_max, last_max);
+                                if not_descending {
+                                    self.data_page_boundary_descending = false;
+                                }
+                            }
+                        }
+                        self.last_non_null_data_page_min_max =
+                            Some((new_min.clone(), new_max.clone()));
+
+                        if self.can_truncate_value() {
+                            let trunc_min = self
+                                .truncate_min_value(
+                                    self.props.column_index_truncate_length(),
+                                    stat.min_bytes_opt().unwrap(),
+                                )
+                                .0;
+                            let trunc_max = self
+                                .truncate_max_value(
+                                    self.props.column_index_truncate_length(),
+                                    stat.max_bytes_opt().unwrap(),
+                                )
+                                .0;
+                            self.column_index_builder.as_mut().unwrap().append(
+                                null_page,
+                                trunc_min,
+                                trunc_max,
+                                self.page_metrics.num_page_nulls as i64,
+                            );
+                        } else {
+                            self.column_index_builder.as_mut().unwrap().append(
+                                null_page,
+                                stat.min_bytes_opt().unwrap().to_vec(),
+                                stat.max_bytes_opt().unwrap().to_vec(),
+                                self.page_metrics.num_page_nulls as i64,
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        // Append page histograms to the `ColumnIndex` histograms
-        self.column_index_builder.append_histograms(
-            &self.page_metrics.repetition_level_histogram,
-            &self.page_metrics.definition_level_histogram,
-        );
+            // Append page histograms to the `ColumnIndex` histograms.
+            // Note `column_index_builder` may have been set to `None` above.
+            if let Some(builder) = self.column_index_builder.as_mut() {
+                builder.append_histograms(
+                    &self.page_metrics.repetition_level_histogram,
+                    &self.page_metrics.definition_level_histogram,
+                )
+            }
+        }
 
         // Update the offset index
         self.offset_index_builder
