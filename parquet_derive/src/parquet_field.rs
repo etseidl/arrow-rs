@@ -332,7 +332,7 @@ impl Field {
         };
 
         if let Some(converted_type) = converted_type {
-            builder = quote! { #builder.with_converted_type(#converted_type) };
+            builder = quote! { #builder.with_converted_type(Some(#converted_type)) };
         }
 
         if let Some(length) = length {
