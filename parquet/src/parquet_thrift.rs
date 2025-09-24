@@ -303,6 +303,18 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         Ok((field_type, field_delta))
     }
 
+    /// This is for skipping structs. We don't need the field id's, just the field type.
+    fn skip_field_header(&mut self) -> Result<FieldType> {
+        let field_type = self.read_byte()?;
+        let field_delta = (field_type & 0xf0) >> 4;
+        let field_type = field_type & 0xf;
+        // field type isn't Stop and delta is > 15
+        if field_type != 0 && field_delta == 0 {
+            self.read_i16()?;
+        }
+        Ok(FieldType::try_from(field_type)?)
+    }
+
     /// Read a boolean list element. This should not be used for struct fields. For the latter,
     /// use the [`FieldIdentifier::bool_val`] field.
     fn read_bool(&mut self) -> Result<bool> {
@@ -402,14 +414,12 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
             7 => self.skip_bytes(8),
             8 => self.skip_binary(),
             12 => {
-                let mut last_field_id = 0i16;
                 loop {
-                    let field_ident = self.read_field_begin(last_field_id)?;
-                    if field_ident.field_type as u8 == 0 {
+                    let field_type = self.skip_field_header()?;
+                    if field_type as u8 == 0 {
                         break;
                     }
-                    self.skip_till_depth(field_ident.field_type, depth - 1)?;
-                    last_field_id = field_ident.id;
+                    self.skip_till_depth(field_type, depth - 1)?;
                 }
                 Ok(())
             }
