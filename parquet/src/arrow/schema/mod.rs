@@ -264,7 +264,7 @@ pub fn add_encoded_arrow_schema_to_metadata(schema: &Schema, props: &mut WriterP
 ///         ),
 ///         Arc::new(
 ///          Type::primitive_type_builder("b", basic::Type::INT32)
-///           .with_converted_type(basic::ConvertedType::DATE)
+///           .with_converted_type(Some(basic::ConvertedType::DATE))
 ///           .with_logical_type(Some(basic::LogicalType::Date))
 ///           .build().unwrap()
 ///         ),
@@ -596,7 +596,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .build(),
         DataType::Interval(_) => {
             Type::primitive_type_builder(name, PhysicalType::FIXED_LEN_BYTE_ARRAY)
-                .with_converted_type(ConvertedType::INTERVAL)
+                .with_converted_type(Some(ConvertedType::INTERVAL))
                 .with_repetition(repetition)
                 .with_id(id)
                 .with_length(12)

@@ -146,7 +146,7 @@ impl<T: DataType> ColumnValueEncoderImpl<T> {
     fn write_slice(&mut self, slice: &[T::T]) -> Result<()> {
         if self.statistics_enabled != EnabledStatistics::None
             // INTERVAL has undefined sort order, so don't write min/max stats for it
-            && self.descr.converted_type() != ConvertedType::INTERVAL
+            && self.descr.converted_type() != Some(ConvertedType::INTERVAL)
         {
             if let Some((min, max)) = self.min_max(slice, None) {
                 update_min(&self.descr, &min, &mut self.min_value);

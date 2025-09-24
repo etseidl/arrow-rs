@@ -177,7 +177,7 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     type Buffer = OffsetBuffer<I>;
 
     fn new(desc: &ColumnDescPtr) -> Self {
-        let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
+        let validate_utf8 = desc.converted_type() == Some(ConvertedType::UTF8);
         Self {
             dict: None,
             decoder: None,

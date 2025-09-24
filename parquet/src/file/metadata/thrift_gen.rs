@@ -1347,10 +1347,7 @@ fn write_schema_helper<W: Write>(
                 repetition_type: Some(basic_info.repetition()),
                 name: basic_info.name(),
                 num_children: None,
-                converted_type: match basic_info.converted_type() {
-                    ConvertedType::NONE => None,
-                    other => Some(other),
-                },
+                converted_type: basic_info.converted_type(),
                 scale: if *scale >= 0 { Some(*scale) } else { None },
                 precision: if *precision >= 0 {
                     Some(*precision)
@@ -1379,10 +1376,7 @@ fn write_schema_helper<W: Write>(
                 repetition_type: repetition,
                 name: basic_info.name(),
                 num_children: Some(fields.len() as i32),
-                converted_type: match basic_info.converted_type() {
-                    ConvertedType::NONE => None,
-                    other => Some(other),
-                },
+                converted_type: basic_info.converted_type(),
                 scale: None,
                 precision: None,
                 field_id: if basic_info.has_id() {

@@ -1035,7 +1035,8 @@ mod tests {
     #[cfg(feature = "arrow")]
     use crate::arrow::ArrowWriter;
     use crate::basic::{
-        ColumnOrder, Compression, ConvertedType, Encoding, LogicalType, Repetition, SortOrder, Type,
+        converted_type_for_logical, ColumnOrder, Compression, ConvertedType, Encoding, LogicalType,
+        Repetition, SortOrder, Type,
     };
     use crate::column::page::{Page, PageReader};
     use crate::column::reader::get_typed_column_reader;
@@ -1164,7 +1165,7 @@ mod tests {
                     ),
                     Arc::new(
                         types::Type::primitive_type_builder("col2", Type::FIXED_LEN_BYTE_ARRAY)
-                            .with_converted_type(ConvertedType::INTERVAL)
+                            .with_converted_type(Some(ConvertedType::INTERVAL))
                             .with_length(12)
                             .build()
                             .unwrap(),
@@ -1270,7 +1271,7 @@ mod tests {
         let field = Arc::new(
             types::Type::primitive_type_builder("col1", Type::INT32)
                 .with_logical_type(field_logical_type.clone())
-                .with_converted_type(field_logical_type.into())
+                .with_converted_type(converted_type_for_logical(field_logical_type))
                 .build()
                 .unwrap(),
         );

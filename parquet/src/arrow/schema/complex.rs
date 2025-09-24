@@ -530,8 +530,8 @@ impl Visitor {
             self.visit_primitive(cur_type, context)
         } else {
             match cur_type.get_basic_info().converted_type() {
-                ConvertedType::LIST => self.visit_list(cur_type, context),
-                ConvertedType::MAP | ConvertedType::MAP_KEY_VALUE => {
+                Some(ConvertedType::LIST) => self.visit_list(cur_type, context),
+                Some(ConvertedType::MAP) | Some(ConvertedType::MAP_KEY_VALUE) => {
                     self.visit_map(cur_type, context)
                 }
                 _ => self.visit_struct(cur_type, context),

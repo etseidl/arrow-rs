@@ -883,7 +883,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// Returns `true` if this column's logical type is a UTF-8 string.
     fn is_utf8(&self) -> bool {
         self.get_descriptor().logical_type() == Some(LogicalType::String)
-            || self.get_descriptor().converted_type() == ConvertedType::UTF8
+            || self.get_descriptor().converted_type() == Some(ConvertedType::UTF8)
     }
 
     /// Truncates a binary statistic to at most `truncation_length` bytes.
@@ -1423,12 +1423,15 @@ fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) 
             }
 
             match descr.converted_type() {
-                ConvertedType::UINT_8
-                | ConvertedType::UINT_16
-                | ConvertedType::UINT_32
-                | ConvertedType::UINT_64 => {
-                    return compare_greater_unsigned_int(a, b);
-                }
+                Some(converted_type) => match converted_type {
+                    ConvertedType::UINT_8
+                    | ConvertedType::UINT_16
+                    | ConvertedType::UINT_32
+                    | ConvertedType::UINT_64 => {
+                        return compare_greater_unsigned_int(a, b);
+                    }
+                    _ => {}
+                },
                 _ => {}
             };
         }
@@ -1436,7 +1439,7 @@ fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) 
             if let Some(LogicalType::Decimal { .. }) = descr.logical_type() {
                 return compare_greater_byte_array_decimals(a.as_bytes(), b.as_bytes());
             }
-            if let ConvertedType::DECIMAL = descr.converted_type() {
+            if let Some(ConvertedType::DECIMAL) = descr.converted_type() {
                 return compare_greater_byte_array_decimals(a.as_bytes(), b.as_bytes());
             }
             if let Some(LogicalType::Float16) = descr.logical_type() {
@@ -4258,7 +4261,7 @@ mod tests {
         let tpe =
             SchemaType::primitive_type_builder("col", FixedLenByteArrayType::get_physical_type())
                 .with_length(12)
-                .with_converted_type(ConvertedType::INTERVAL)
+                .with_converted_type(Some(ConvertedType::INTERVAL))
                 .build()
                 .unwrap();
         ColumnDescriptor::new(Arc::new(tpe), 0, 0, path)
@@ -4286,7 +4289,7 @@ mod tests {
     ) -> ColumnDescriptor {
         let path = ColumnPath::from("col");
         let tpe = SchemaType::primitive_type_builder("col", T::get_physical_type())
-            .with_converted_type(ConvertedType::UINT_32)
+            .with_converted_type(Some(ConvertedType::UINT_32))
             .build()
             .unwrap();
         ColumnDescriptor::new(Arc::new(tpe), max_def_level, max_rep_level, path)
