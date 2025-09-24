@@ -392,20 +392,20 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
             return Err(general_err!(format!("cannot parse past {:?}", field_type)));
         }
 
-        match field_type {
+        match field_type as u8 {
             // boolean field has no data
-            FieldType::BooleanFalse | FieldType::BooleanTrue => Ok(()),
-            FieldType::Byte => self.read_i8().map(|_| ()),
-            FieldType::I16 => self.skip_vlq().map(|_| ()),
-            FieldType::I32 => self.skip_vlq().map(|_| ()),
-            FieldType::I64 => self.skip_vlq().map(|_| ()),
-            FieldType::Double => self.skip_bytes(8).map(|_| ()),
-            FieldType::Binary => self.skip_binary().map(|_| ()),
-            FieldType::Struct => {
+            1 | 2 => Ok(()),
+            3 => self.skip_bytes(1),
+            4 => self.skip_vlq(),
+            5 => self.skip_vlq(),
+            6 => self.skip_vlq(),
+            7 => self.skip_bytes(8),
+            8 => self.skip_binary(),
+            12 => {
                 let mut last_field_id = 0i16;
                 loop {
                     let field_ident = self.read_field_begin(last_field_id)?;
-                    if field_ident.field_type == FieldType::Stop {
+                    if field_ident.field_type as u8 == 0 {
                         break;
                     }
                     self.skip_till_depth(field_ident.field_type, depth - 1)?;
@@ -413,7 +413,7 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                 }
                 Ok(())
             }
-            FieldType::List => {
+            9 => {
                 let list_ident = self.read_list_begin()?;
                 for _ in 0..list_ident.size {
                     let element_type = FieldType::try_from(list_ident.element_type)?;
@@ -481,6 +481,19 @@ impl<'b, 'a: 'b> ThriftCompactInputProtocol<'b> for ThriftSliceInputProtocol<'a>
         match slice.try_into() {
             Ok(slice) => Ok(f64::from_le_bytes(slice)),
             Err(_) => Err(general_err!("Unexpected error converting slice")),
+        }
+    }
+
+    /// Skip a ULEB128 encoded varint.
+    fn skip_vlq(&mut self) -> Result<()> {
+        let mut idx = 0;
+        loop {
+            let b = self.buf[idx] >> 7;
+            idx += 1;
+            if b == 0 {
+                self.buf = &self.buf[idx..];
+                return Ok(())
+            }
         }
     }
 }

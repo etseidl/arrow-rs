@@ -20,6 +20,8 @@
 pub use thrift::protocol::TCompactOutputProtocol;
 use thrift::protocol::{TInputProtocol, TOutputProtocol};
 
+use crate::parquet_thrift::ThriftCompactInputProtocol;
+
 /// Reads and writes the struct to Thrift protocols.
 ///
 /// Unlike [`thrift::protocol::TSerializable`] this uses generics instead of trait objects
@@ -34,6 +36,12 @@ pub trait TSerializable: Sized {
 #[doc(hidden)]
 pub fn bench_file_metadata(bytes: &bytes::Bytes) {
     crate::file::metadata::thrift_gen::bench_file_metadata(bytes);
+}
+
+#[doc(hidden)]
+pub fn bench_skip_metadata(bytes: &bytes::Bytes) {
+    let mut prot = crate::parquet_thrift::ThriftSliceInputProtocol::new(bytes.as_ref());
+    prot.skip(crate::parquet_thrift::FieldType::Struct).unwrap();
 }
 
 // Public function to aid benchmarking. Reads Parquet `PageHeader` encoded in `bytes`.
