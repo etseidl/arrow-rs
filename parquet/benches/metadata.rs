@@ -80,7 +80,7 @@ fn encoded_meta() -> Vec<u8> {
     let row_groups = (0..NUM_ROW_GROUPS)
         .map(|i| {
             let columns = (0..NUM_COLUMNS)
-                .map(|_| ColumnChunk {
+                .map(|i| ColumnChunk {
                     file_path: None,
                     file_offset: 0,
                     meta_data: Some(ColumnMetaData {
@@ -88,13 +88,13 @@ fn encoded_meta() -> Vec<u8> {
                         encodings: vec![Encoding::PLAIN, Encoding::RLE_DICTIONARY],
                         path_in_schema: vec![],
                         codec: CompressionCodec::UNCOMPRESSED,
-                        num_values: rng.random(),
-                        total_uncompressed_size: rng.random(),
-                        total_compressed_size: rng.random(),
+                        num_values: 100000,
+                        total_uncompressed_size: 10000000,
+                        total_compressed_size: 5000000,
                         key_value_metadata: None,
-                        data_page_offset: rng.random(),
-                        index_page_offset: Some(rng.random()),
-                        dictionary_page_offset: Some(rng.random()),
+                        data_page_offset: i as i64 * 100000 + 4,
+                        index_page_offset: None,
+                        dictionary_page_offset: Some(i as i64 * 200000),
                         statistics: Some(stats.clone()),
                         encoding_stats: Some(vec![
                             PageEncodingStats {
@@ -113,10 +113,10 @@ fn encoded_meta() -> Vec<u8> {
                         size_statistics: None,
                         geospatial_statistics: None,
                     }),
-                    offset_index_offset: Some(rng.random()),
-                    offset_index_length: Some(rng.random()),
-                    column_index_offset: Some(rng.random()),
-                    column_index_length: Some(rng.random()),
+                    offset_index_offset: Some(i as i64 * 1024),
+                    offset_index_length: Some(1024),
+                    column_index_offset: Some(i as i64 * 1024 + 1024*1024),
+                    column_index_length: Some(1024),
                     crypto_metadata: None,
                     encrypted_column_metadata: None,
                 })

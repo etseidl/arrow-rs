@@ -126,7 +126,7 @@ pub(crate) fn bench_file_metadata(bytes: &bytes::Bytes) {
 }
 
 // the following are only used internally so are private
-thrift_struct!(
+/*thrift_struct!(
 struct FileMetaData<'a> {
   /** Version of this file **/
   1: required i32 version
@@ -139,9 +139,117 @@ struct FileMetaData<'a> {
   8: optional EncryptionAlgorithm encryption_algorithm
   9: optional binary footer_signing_key_metadata
 }
-);
+);*/
 
-thrift_struct!(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileMetaData<'a> {
+    /// Version of this file *
+    version: i32,
+    schema: Vec<SchemaElement<'a>>,
+    num_rows: i64,
+    row_groups: Vec<RowGroup<'a>>,
+    key_value_metadata: Option<Vec<KeyValue>>,
+    created_by: Option<String>,
+    column_orders: Option<Vec<ColumnOrder>>,
+    encryption_algorithm: Option<EncryptionAlgorithm>,
+    footer_signing_key_metadata: Option<Vec<u8>>,
+}
+
+impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for FileMetaData<'a> {
+    fn read_thrift(prot: &mut R) -> Result<Self> {
+        let mut version: Option<i32> = None;
+        let mut schema: Option<Vec<SchemaElement<'a>>> = None;
+        let mut num_rows: Option<i64> = None;
+        let mut row_groups: Option<Vec<RowGroup<'a>>> = None;
+        let mut key_value_metadata: Option<Vec<KeyValue>> = None;
+        let mut created_by: Option<String> = None;
+        let mut column_orders: Option<Vec<ColumnOrder>> = None;
+        let mut encryption_algorithm: Option<EncryptionAlgorithm> = None;
+        let mut footer_signing_key_metadata: Option<Vec<u8>> = None;
+        let mut last_field_id = 0i16;
+        loop {
+            let field_ident = prot.read_field_begin(last_field_id)?;
+            if field_ident.field_type == FieldType::Stop {
+                break;
+            }
+            match field_ident.id {
+                1 => {
+                    let val = i32::read_thrift(&mut *prot)?;
+                    version = Some(val);
+                }
+                2 => {
+                    let val = read_thrift_vec::<SchemaElement, R>(&mut *prot)?;
+                    schema = Some(val);
+                }
+                3 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    num_rows = Some(val);
+                }
+                4 => {
+                    let val = read_thrift_vec::<RowGroup, R>(&mut *prot)?;
+                    row_groups = Some(val);
+                }
+                5 => {
+                    let val = read_thrift_vec::<KeyValue, R>(&mut *prot)?;
+                    key_value_metadata = Some(val);
+                }
+                6 => {
+                    let val = String::read_thrift(&mut *prot)?;
+                    created_by = Some(val);
+                }
+                7 => {
+                    let val = read_thrift_vec::<ColumnOrder, R>(&mut *prot)?;
+                    column_orders = Some(val);
+                }
+                8 => {
+                    let val = EncryptionAlgorithm::read_thrift(&mut *prot)?;
+                    encryption_algorithm = Some(val);
+                }
+                9 => {
+                    let val = prot.read_bytes_owned()?;
+                    footer_signing_key_metadata = Some(val);
+                }
+                _ => {
+                    prot.skip(field_ident.field_type)?;
+                }
+            };
+            last_field_id = field_ident.id;
+        }
+        let Some(version) = version else {
+            return Err(ParquetError::General(
+                "Required field version is missing".to_owned(),
+            ));
+        };
+        let Some(schema) = schema else {
+            return Err(ParquetError::General(
+                "Required field schema is missing".to_owned(),
+            ));
+        };
+        let Some(num_rows) = num_rows else {
+            return Err(ParquetError::General(
+                "Required field num_rows is missing".to_owned(),
+            ));
+        };
+        let Some(row_groups) = row_groups else {
+            return Err(ParquetError::General(
+                "Required field row_groups is missing".to_owned(),
+            ));
+        };
+        Ok(Self {
+            version,
+            schema,
+            num_rows,
+            row_groups,
+            key_value_metadata,
+            created_by,
+            column_orders,
+            encryption_algorithm,
+            footer_signing_key_metadata,
+        })
+    }
+}
+
+/*thrift_struct!(
 struct RowGroup<'a> {
   1: required list<'a><ColumnChunk> columns
   2: required i64 total_byte_size
@@ -152,9 +260,90 @@ struct RowGroup<'a> {
   //6: optional i64 total_compressed_size
   7: optional i16 ordinal
 }
-);
+);*/
 
-#[cfg(feature = "encryption")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RowGroup<'a> {
+    columns: Vec<ColumnChunk<'a>>,
+    total_byte_size: i64,
+    num_rows: i64,
+    sorting_columns: Option<Vec<SortingColumn>>,
+    file_offset: Option<i64>,
+    ordinal: Option<i16>,
+}
+
+impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for RowGroup<'a> {
+    fn read_thrift(prot: &mut R) -> Result<Self> {
+        let mut columns: Option<Vec<ColumnChunk<'a>>> = None;
+        let mut total_byte_size: Option<i64> = None;
+        let mut num_rows: Option<i64> = None;
+        let mut sorting_columns: Option<Vec<SortingColumn>> = None;
+        let mut file_offset: Option<i64> = None;
+        let mut ordinal: Option<i16> = None;
+        let mut last_field_id = 0i16;
+        loop {
+            let field_ident = prot.read_field_begin(last_field_id)?;
+            if field_ident.field_type == FieldType::Stop {
+                break;
+            }
+            match field_ident.id {
+                1 => {
+                    let val = read_thrift_vec::<ColumnChunk, R>(&mut *prot)?;
+                    columns = Some(val);
+                }
+                2 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    total_byte_size = Some(val);
+                }
+                3 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    num_rows = Some(val);
+                }
+                4 => {
+                    let val = read_thrift_vec::<SortingColumn, R>(&mut *prot)?;
+                    sorting_columns = Some(val);
+                }
+                5 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    file_offset = Some(val);
+                }
+                7 => {
+                    let val = i16::read_thrift(&mut *prot)?;
+                    ordinal = Some(val);
+                }
+                _ => {
+                    prot.skip(field_ident.field_type)?;
+                }
+            };
+            last_field_id = field_ident.id;
+        }
+        let Some(columns) = columns else {
+            return Err(ParquetError::General(
+                "Required field columns is missing".to_owned(),
+            ));
+        };
+        let Some(total_byte_size) = total_byte_size else {
+            return Err(ParquetError::General(
+                "Required field total_byte_size is missing".to_owned(),
+            ));
+        };
+        let Some(num_rows) = num_rows else {
+            return Err(ParquetError::General(
+                "Required field num_rows is missing".to_owned(),
+            ));
+        };
+        Ok(Self {
+            columns,
+            total_byte_size,
+            num_rows,
+            sorting_columns,
+            file_offset,
+            ordinal,
+        })
+    }
+}
+
+/*#[cfg(feature = "encryption")]
 thrift_struct!(
 struct ColumnChunk<'a> {
   1: optional string<'a> file_path
@@ -171,7 +360,7 @@ struct ColumnChunk<'a> {
 #[cfg(not(feature = "encryption"))]
 thrift_struct!(
 struct ColumnChunk<'a> {
-  1: optional string file_path
+  1: optional string<'a> file_path
   2: required i64 file_offset = 0
   3: optional ColumnMetaData<'a> meta_data
   4: optional i64 offset_index_offset
@@ -179,10 +368,274 @@ struct ColumnChunk<'a> {
   6: optional i64 column_index_offset
   7: optional i32 column_index_length
 }
-);
+);*/
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColumnChunk<'a> {
+    file_path: Option<&'a str>,
+    file_offset: i64,
+    meta_data: Option<ColumnMetaData<'a>>,
+    offset_index_offset: Option<i64>,
+    offset_index_length: Option<i32>,
+    column_index_offset: Option<i64>,
+    column_index_length: Option<i32>,
+    #[cfg(feature = "encryption")]
+    crypto_metadata: Option<ColumnCryptoMetaData>,
+    #[cfg(feature = "encryption")]
+    encrypted_column_metadata: Option<&'a [u8]>,
+}
+
+impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for ColumnChunk<'a> {
+    fn read_thrift(prot: &mut R) -> Result<Self> {
+        let mut file_path: Option<&'a str> = None;
+        let mut file_offset: Option<i64> = None;
+        let mut meta_data: Option<ColumnMetaData<'a>> = None;
+        let mut offset_index_offset: Option<i64> = None;
+        let mut offset_index_length: Option<i32> = None;
+        let mut column_index_offset: Option<i64> = None;
+        let mut column_index_length: Option<i32> = None;
+        #[cfg(feature = "encryption")]
+        let mut crypto_metadata: Option<ColumnCryptoMetaData> = None;
+        #[cfg(feature = "encryption")]
+        let mut encrypted_column_metadata: Option<&'a [u8]> = None;
+        let mut last_field_id = 0i16;
+        loop {
+            let field_ident = prot.read_field_begin(last_field_id)?;
+            if field_ident.field_type == FieldType::Stop {
+                break;
+            }
+            match field_ident.id {
+                1 => {
+                    let val = <&'a str>::read_thrift(&mut *prot)?;
+                    file_path = Some(val);
+                }
+                2 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    file_offset = Some(val);
+                }
+                3 => {
+                    let val = ColumnMetaData::read_thrift(&mut *prot)?;
+                    meta_data = Some(val);
+                }
+                4 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    offset_index_offset = Some(val);
+                }
+                5 => {
+                    let val = i32::read_thrift(&mut *prot)?;
+                    offset_index_length = Some(val);
+                }
+                6 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    column_index_offset = Some(val);
+                }
+                7 => {
+                    let val = i32::read_thrift(&mut *prot)?;
+                    column_index_length = Some(val);
+                }
+                #[cfg(feature = "encryption")]
+                8 => {
+                    let val = ColumnCryptoMetaData::read_thrift(&mut *prot)?;
+                    crypto_metadata = Some(val);
+                }
+                #[cfg(feature = "encryption")]
+                9 => {
+                    let val = <&'a [u8]>::read_thrift(&mut *prot)?;
+                    encrypted_column_metadata = Some(val);
+                }
+                _ => {
+                    prot.skip(field_ident.field_type)?;
+                }
+            };
+            last_field_id = field_ident.id;
+        }
+        let Some(file_offset) = file_offset else {
+            return Err(ParquetError::General(
+                "Required field file_offset is missing".to_owned(),
+            ));
+        };
+        Ok(Self {
+            file_path,
+            file_offset,
+            meta_data,
+            offset_index_offset,
+            offset_index_length,
+            column_index_offset,
+            column_index_length,
+            #[cfg(feature = "encryption")]
+            crypto_metadata,
+            #[cfg(feature = "encryption")]
+            encrypted_column_metadata,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColumnMetaData<'a> {
+    type_: Type,
+    encodings: Vec<Encoding>,
+    codec: CompressionCodec,
+    num_values: i64,
+    total_uncompressed_size: i64,
+    total_compressed_size: i64,
+    data_page_offset: i64,
+    index_page_offset: Option<i64>,
+    dictionary_page_offset: Option<i64>,
+    statistics: Option<Statistics<'a>>,
+    encoding_stats: Option<Vec<PageEncodingStats>>,
+    bloom_filter_offset: Option<i64>,
+    bloom_filter_length: Option<i32>,
+    size_statistics: Option<SizeStatistics>,
+    geospatial_statistics: Option<GeospatialStatistics>,
+}
+
+impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for ColumnMetaData<'a> {
+    fn read_thrift(prot: &mut R) -> Result<Self> {
+        let mut type_: Option<Type> = None;
+        let mut encodings: Option<Vec<Encoding>> = None;
+        let mut codec: Option<CompressionCodec> = None;
+        let mut num_values: Option<i64> = None;
+        let mut total_uncompressed_size: Option<i64> = None;
+        let mut total_compressed_size: Option<i64> = None;
+        let mut data_page_offset: Option<i64> = None;
+        let mut index_page_offset: Option<i64> = None;
+        let mut dictionary_page_offset: Option<i64> = None;
+        let mut statistics: Option<Statistics<'a>> = None;
+        let mut encoding_stats: Option<Vec<PageEncodingStats>> = None;
+        let mut bloom_filter_offset: Option<i64> = None;
+        let mut bloom_filter_length: Option<i32> = None;
+        let mut size_statistics: Option<SizeStatistics> = None;
+        let mut geospatial_statistics: Option<GeospatialStatistics> = None;
+        let mut last_field_id = 0i16;
+        loop {
+            let field_ident = prot.read_field_begin(last_field_id)?;
+            if field_ident.field_type == FieldType::Stop {
+                break;
+            }
+            match field_ident.id {
+                1 => {
+                    let val = Type::read_thrift(&mut *prot)?;
+                    type_ = Some(val);
+                }
+                2 => {
+                    let val = read_thrift_vec::<Encoding, R>(&mut *prot)?;
+                    encodings = Some(val);
+                }
+                4 => {
+                    let val = CompressionCodec::read_thrift(&mut *prot)?;
+                    codec = Some(val);
+                }
+                5 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    num_values = Some(val);
+                }
+                6 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    total_uncompressed_size = Some(val);
+                }
+                7 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    total_compressed_size = Some(val);
+                }
+                9 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    data_page_offset = Some(val);
+                }
+                10 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    index_page_offset = Some(val);
+                }
+                11 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    dictionary_page_offset = Some(val);
+                }
+                /*12 => {
+                    let val = Statistics::read_thrift(&mut *prot)?;
+                    statistics = Some(val);
+                }
+                13 => {
+                    let val = read_thrift_vec::<PageEncodingStats, R>(&mut *prot)?;
+                    encoding_stats = Some(val);
+                }*/
+                14 => {
+                    let val = i64::read_thrift(&mut *prot)?;
+                    bloom_filter_offset = Some(val);
+                }
+                15 => {
+                    let val = i32::read_thrift(&mut *prot)?;
+                    bloom_filter_length = Some(val);
+                }
+                16 => {
+                    let val = SizeStatistics::read_thrift(&mut *prot)?;
+                    size_statistics = Some(val);
+                }
+                17 => {
+                    let val = GeospatialStatistics::read_thrift(&mut *prot)?;
+                    geospatial_statistics = Some(val);
+                }
+                _ => {
+                    prot.skip(field_ident.field_type)?;
+                }
+            };
+            last_field_id = field_ident.id;
+        }
+        let Some(type_) = type_ else {
+            return Err(ParquetError::General(
+                "Required field type_ is missing".to_owned(),
+            ));
+        };
+        let Some(encodings) = encodings else {
+            return Err(ParquetError::General(
+                "Required field encodings is missing".to_owned(),
+            ));
+        };
+        let Some(codec) = codec else {
+            return Err(ParquetError::General(
+                "Required field codec is missing".to_owned(),
+            ));
+        };
+        let Some(num_values) = num_values else {
+            return Err(ParquetError::General(
+                "Required field num_values is missing".to_owned(),
+            ));
+        };
+        let Some(total_uncompressed_size) = total_uncompressed_size else {
+            return Err(ParquetError::General(
+                "Required field total_uncompressed_size is missing".to_owned(),
+            ));
+        };
+        let Some(total_compressed_size) = total_compressed_size else {
+            return Err(ParquetError::General(
+                "Required field total_compressed_size is missing".to_owned(),
+            ));
+        };
+        let Some(data_page_offset) = data_page_offset else {
+            return Err(ParquetError::General(
+                "Required field data_page_offset is missing".to_owned(),
+            ));
+        };
+        Ok(Self {
+            type_,
+            encodings,
+            codec,
+            num_values,
+            total_uncompressed_size,
+            total_compressed_size,
+            data_page_offset,
+            index_page_offset,
+            dictionary_page_offset,
+            statistics,
+            encoding_stats,
+            bloom_filter_offset,
+            bloom_filter_length,
+            size_statistics,
+            geospatial_statistics,
+        })
+    }
+}
 
 type CompressionCodec = Compression;
-thrift_struct!(
+/*thrift_struct!(
 struct ColumnMetaData<'a> {
   1: required Type type_
   2: required list<Encoding> encodings
@@ -204,7 +657,7 @@ struct ColumnMetaData<'a> {
   16: optional SizeStatistics size_statistics;
   17: optional GeospatialStatistics geospatial_statistics;
 }
-);
+);*/
 
 thrift_struct!(
 struct BoundingBox {
