@@ -24,7 +24,8 @@ use crate::file::metadata::thrift_gen::SchemaElement;
 use crate::file::metadata::HeapSize;
 
 use crate::basic::{
-    ColumnOrder, ConvertedType, LogicalType, Repetition, SortOrder, TimeUnit, Type as PhysicalType,
+    ColumnOrder, ConvertedType, DecimalType, IntType, LogicalType, Repetition, SortOrder, TimeType,
+    TimeUnit, Type as PhysicalType,
 };
 use crate::errors::{ParquetError, Result};
 
@@ -356,7 +357,7 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                     ));
                 }
                 (LogicalType::Enum, PhysicalType::BYTE_ARRAY) => {}
-                (LogicalType::Decimal { scale, precision }, _) => {
+                (LogicalType::Decimal(DecimalType { scale, precision }), _) => {
                     // Check that scale and precision are consistent with legacy values
                     if *scale != self.scale {
                         return Err(general_err!(
@@ -378,13 +379,13 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                 }
                 (LogicalType::Date, PhysicalType::INT32) => {}
                 (
-                    LogicalType::Time {
+                    LogicalType::Time(TimeType {
                         unit: TimeUnit::MILLIS,
                         ..
-                    },
+                    }),
                     PhysicalType::INT32,
                 ) => {}
-                (LogicalType::Time { unit, .. }, PhysicalType::INT64) => {
+                (LogicalType::Time(TimeType { unit, .. }), PhysicalType::INT64) => {
                     if *unit == TimeUnit::MILLIS {
                         return Err(general_err!(
                             "Cannot use millisecond unit on INT64 type for field '{}'",
@@ -393,9 +394,9 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                     }
                 }
                 (LogicalType::Timestamp { .. }, PhysicalType::INT64) => {}
-                (LogicalType::Integer { bit_width, .. }, PhysicalType::INT32)
+                (LogicalType::Integer(IntType { bit_width, .. }), PhysicalType::INT32)
                     if *bit_width <= 32 => {}
-                (LogicalType::Integer { bit_width, .. }, PhysicalType::INT64)
+                (LogicalType::Integer(IntType { bit_width, .. }), PhysicalType::INT64)
                     if *bit_width == 64 => {}
                 // Null type
                 (LogicalType::Unknown, PhysicalType::INT32) => {}
@@ -1213,7 +1214,7 @@ fn build_tree<'a>(
 
 /// Checks if the logical type is valid.
 fn check_logical_type(logical_type: &Option<LogicalType>) -> Result<()> {
-    if let Some(LogicalType::Integer { bit_width, .. }) = *logical_type {
+    if let Some(LogicalType::Integer(IntType { bit_width, .. })) = *logical_type {
         if bit_width != 8 && bit_width != 16 && bit_width != 32 && bit_width != 64 {
             return Err(general_err!(
                 "Bit width must be 8, 16, 32, or 64 for Integer logical type"
@@ -1379,10 +1380,10 @@ mod tests {
     #[test]
     fn test_primitive_type() {
         let mut result = Type::primitive_type_builder("foo", PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 32,
                 is_signed: true,
-            }))
+            })))
             .with_id(Some(0))
             .build();
         assert!(result.is_ok());
@@ -1394,10 +1395,10 @@ mod tests {
             assert_eq!(basic_info.repetition(), Repetition::OPTIONAL);
             assert_eq!(
                 basic_info.logical_type(),
-                Some(LogicalType::Integer {
+                Some(LogicalType::Integer(IntType {
                     bit_width: 32,
                     is_signed: true
-                })
+                }))
             );
             assert_eq!(basic_info.converted_type(), ConvertedType::INT_32);
             assert_eq!(basic_info.id(), 0);
@@ -1412,16 +1413,16 @@ mod tests {
         // Test illegal inputs with logical type
         result = Type::primitive_type_builder("foo", PhysicalType::INT64)
             .with_repetition(Repetition::REPEATED)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 is_signed: true,
                 bit_width: 8,
-            }))
+            })))
             .build();
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
                 format!("{e}"),
-                "Parquet error: Cannot annotate Integer { bit_width: 8, is_signed: true } from INT64 for field 'foo'"
+                "Parquet error: Cannot annotate Integer(IntType { bit_width: 8, is_signed: true }) from INT64 for field 'foo'"
             );
         }
 
@@ -1454,10 +1455,10 @@ mod tests {
 
         result = Type::primitive_type_builder("foo", PhysicalType::BYTE_ARRAY)
             .with_repetition(Repetition::REQUIRED)
-            .with_logical_type(Some(LogicalType::Decimal {
+            .with_logical_type(Some(LogicalType::Decimal(DecimalType {
                 scale: 32,
                 precision: 12,
-            }))
+            })))
             .with_precision(-1)
             .with_scale(-1)
             .build();

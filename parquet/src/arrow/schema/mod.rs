@@ -28,7 +28,7 @@ use arrow_schema::extension::{Json, Uuid};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 
 use crate::basic::{
-    ConvertedType, LogicalType, Repetition, TimeUnit as ParquetTimeUnit, Type as PhysicalType,
+    ConvertedType, DecimalType, IntType, LogicalType, Repetition, TimeType, TimeUnit as ParquetTimeUnit, TimestampType, Type as PhysicalType
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::{metadata::KeyValue, properties::WriterProperties};
@@ -449,18 +449,18 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .with_id(id)
             .build(),
         DataType::Int8 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::Int16 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 16,
                 is_signed: true,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -473,34 +473,34 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .with_id(id)
             .build(),
         DataType::UInt8 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: false,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt16 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 16,
                 is_signed: false,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt32 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 32,
                 is_signed: false,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt64 => Type::primitive_type_builder(name, PhysicalType::INT64)
-            .with_logical_type(Some(LogicalType::Integer {
+            .with_logical_type(Some(LogicalType::Integer(IntType {
                 bit_width: 64,
                 is_signed: false,
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -527,7 +527,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
         }
         DataType::Timestamp(time_unit, tz) => {
             Type::primitive_type_builder(name, PhysicalType::INT64)
-                .with_logical_type(Some(LogicalType::Timestamp {
+                .with_logical_type(Some(LogicalType::Timestamp(TimestampType {
                     // If timezone set, values are normalized to UTC timezone
                     is_adjusted_to_u_t_c: matches!(tz, Some(z) if !z.as_ref().is_empty()),
                     unit: match time_unit {
@@ -536,7 +536,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                         TimeUnit::Microsecond => ParquetTimeUnit::MICROS,
                         TimeUnit::Nanosecond => ParquetTimeUnit::NANOS,
                     },
-                }))
+                })))
                 .with_repetition(repetition)
                 .with_id(id)
                 .build()
@@ -568,25 +568,25 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                 .build()
         }
         DataType::Time32(unit) => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Time {
+            .with_logical_type(Some(LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: field.metadata().contains_key("adjusted_to_utc"),
                 unit: match unit {
                     TimeUnit::Millisecond => ParquetTimeUnit::MILLIS,
                     u => unreachable!("Invalid unit for Time32: {:?}", u),
                 },
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::Time64(unit) => Type::primitive_type_builder(name, PhysicalType::INT64)
-            .with_logical_type(Some(LogicalType::Time {
+            .with_logical_type(Some(LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: field.metadata().contains_key("adjusted_to_utc"),
                 unit: match unit {
                     TimeUnit::Microsecond => ParquetTimeUnit::MICROS,
                     TimeUnit::Nanosecond => ParquetTimeUnit::NANOS,
                     u => unreachable!("Invalid unit for Time64: {:?}", u),
                 },
-            }))
+            })))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -649,10 +649,10 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                 .with_repetition(repetition)
                 .with_id(id)
                 .with_length(length)
-                .with_logical_type(Some(LogicalType::Decimal {
+                .with_logical_type(Some(LogicalType::Decimal(DecimalType {
                     scale: *scale as i32,
                     precision: *precision as i32,
-                }))
+                })))
                 .with_precision(*precision as i32)
                 .with_scale(*scale as i32)
                 .build()

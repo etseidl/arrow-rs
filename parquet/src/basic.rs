@@ -29,7 +29,7 @@ use crate::parquet_thrift::{
     ElementType, FieldType, ReadThrift, ThriftCompactInputProtocol, ThriftCompactOutputProtocol,
     WriteThrift, WriteThriftField,
 };
-use crate::{thrift_enum, thrift_struct, thrift_union_all_empty};
+use crate::{thrift_enum, thrift_struct, thrift_union_all_empty, thrift_union_with_unknown};
 
 use crate::errors::{ParquetError, Result};
 
@@ -240,31 +240,37 @@ union TimeUnit {
 // private structs for decoding logical type
 
 thrift_struct!(
-struct DecimalType {
+pub struct DecimalType {
   1: required i32 scale
   2: required i32 precision
 }
 );
 
 thrift_struct!(
-struct TimestampType {
+pub struct TimestampType {
   1: required bool is_adjusted_to_u_t_c
   2: required TimeUnit unit
 }
 );
 
 // they are identical
-use TimestampType as TimeType;
+pub use TimestampType as TimeType;
+/*thrift_struct!(
+pub struct TimeType {
+  1: required bool is_adjusted_to_u_t_c
+  2: required TimeUnit unit
+}
+);*/
 
 thrift_struct!(
-struct IntType {
+pub struct IntType {
   1: required i8 bit_width
   2: required bool is_signed
 }
 );
 
 thrift_struct!(
-struct VariantType {
+pub struct VariantType {
   // The version of the variant specification that the variant was
   // written with.
   1: optional i8 specification_version
@@ -272,323 +278,45 @@ struct VariantType {
 );
 
 thrift_struct!(
-struct GeometryType<'a> {
-  1: optional string<'a> crs;
+pub struct GeometryType {
+  1: optional string crs;
 }
 );
 
 thrift_struct!(
-struct GeographyType<'a> {
-  1: optional string<'a> crs;
+pub struct GeographyType {
+  1: optional string crs;
   2: optional EdgeInterpolationAlgorithm algorithm;
 }
 );
 
-// TODO(ets): should we switch to tuple variants so we can use
-// the thrift macros?
-
+thrift_union_with_unknown!(
 /// Logical types used by version 2.4.0+ of the Parquet format.
 ///
 /// This is an *entirely new* struct as of version
 /// 4.0.0. The struct previously named `LogicalType` was renamed to
 /// [`ConvertedType`]. Please see the README.md for more details.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogicalType {
-    /// A UTF8 encoded string.
-    String,
-    /// A map of key-value pairs.
-    Map,
-    /// A list of elements.
-    List,
-    /// A set of predefined values.
-    Enum,
-    /// A decimal value with a specified scale and precision.
-    Decimal {
-        /// The number of digits in the decimal.
-        scale: i32,
-        /// The location of the decimal point.
-        precision: i32,
-    },
-    /// A date stored as days since Unix epoch.
-    Date,
-    /// A time stored as [`TimeUnit`] since midnight.
-    Time {
-        /// Whether the time is adjusted to UTC.
-        is_adjusted_to_u_t_c: bool,
-        /// The unit of time.
-        unit: TimeUnit,
-    },
-    /// A timestamp stored as [`TimeUnit`] since Unix epoch.
-    Timestamp {
-        /// Whether the timestamp is adjusted to UTC.
-        is_adjusted_to_u_t_c: bool,
-        /// The unit of time.
-        unit: TimeUnit,
-    },
-    /// An integer with a specified bit width and signedness.
-    Integer {
-        /// The number of bits in the integer.
-        bit_width: i8,
-        /// Whether the integer is signed.
-        is_signed: bool,
-    },
-    /// An unknown logical type.
-    Unknown,
-    /// A JSON document.
-    Json,
-    /// A BSON document.
-    Bson,
-    /// A UUID.
-    Uuid,
-    /// A 16-bit floating point number.
-    Float16,
-    /// A Variant value.
-    Variant {
-        /// The version of the variant specification that the variant was written with.
-        specification_version: Option<i8>,
-    },
-    /// A geospatial feature in the Well-Known Binary (WKB) format with linear/planar edges interpolation.
-    Geometry {
-        /// A custom CRS. If unset the defaults to `OGC:CRS84`.
-        crs: Option<String>,
-    },
-    /// A geospatial feature in the WKB format with an explicit (non-linear/non-planar) edges interpolation.
-    Geography {
-        /// A custom CRS. If unset the defaults to `OGC:CRS84`.
-        crs: Option<String>,
-        /// An optional algorithm can be set to correctly interpret edges interpolation
-        /// of the geometries. If unset, the algorithm defaults to `SPHERICAL``.
-        algorithm: Option<EdgeInterpolationAlgorithm>,
-    },
-    /// For forward compatibility; used when an unknown union value is encountered.
-    _Unknown {
-        /// The field id encountered when parsing the unknown logical type.
-        field_id: i16,
-    },
+union LogicalType {
+  1:  String
+  2:  Map
+  3:  List
+  4:  Enum
+  5:  (DecimalType) Decimal
+  6:  Date
+  7:  (TimeType) Time
+  8:  (TimestampType) Timestamp
+  // 9: reserved for INTERVAL
+  10: (IntType) Integer
+  11: Unknown
+  12: Json
+  13: Bson
+  14: Uuid
+  15: Float16
+  16: (VariantType) Variant
+  17: (GeometryType) Geometry
+  18: (GeographyType) Geography
 }
-
-impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
-    fn read_thrift(prot: &mut R) -> Result<Self> {
-        let field_ident = prot.read_field_begin(0)?;
-        if field_ident.field_type == FieldType::Stop {
-            return Err(general_err!("received empty union from remote LogicalType"));
-        }
-        let ret = match field_ident.id {
-            1 => {
-                prot.skip_empty_struct()?;
-                Self::String
-            }
-            2 => {
-                prot.skip_empty_struct()?;
-                Self::Map
-            }
-            3 => {
-                prot.skip_empty_struct()?;
-                Self::List
-            }
-            4 => {
-                prot.skip_empty_struct()?;
-                Self::Enum
-            }
-            5 => {
-                let val = DecimalType::read_thrift(&mut *prot)?;
-                Self::Decimal {
-                    scale: val.scale,
-                    precision: val.precision,
-                }
-            }
-            6 => {
-                prot.skip_empty_struct()?;
-                Self::Date
-            }
-            7 => {
-                let val = TimeType::read_thrift(&mut *prot)?;
-                Self::Time {
-                    is_adjusted_to_u_t_c: val.is_adjusted_to_u_t_c,
-                    unit: val.unit,
-                }
-            }
-            8 => {
-                let val = TimestampType::read_thrift(&mut *prot)?;
-                Self::Timestamp {
-                    is_adjusted_to_u_t_c: val.is_adjusted_to_u_t_c,
-                    unit: val.unit,
-                }
-            }
-            10 => {
-                let val = IntType::read_thrift(&mut *prot)?;
-                Self::Integer {
-                    is_signed: val.is_signed,
-                    bit_width: val.bit_width,
-                }
-            }
-            11 => {
-                prot.skip_empty_struct()?;
-                Self::Unknown
-            }
-            12 => {
-                prot.skip_empty_struct()?;
-                Self::Json
-            }
-            13 => {
-                prot.skip_empty_struct()?;
-                Self::Bson
-            }
-            14 => {
-                prot.skip_empty_struct()?;
-                Self::Uuid
-            }
-            15 => {
-                prot.skip_empty_struct()?;
-                Self::Float16
-            }
-            16 => {
-                let val = VariantType::read_thrift(&mut *prot)?;
-                Self::Variant {
-                    specification_version: val.specification_version,
-                }
-            }
-            17 => {
-                let val = GeometryType::read_thrift(&mut *prot)?;
-                Self::Geometry {
-                    crs: val.crs.map(|s| s.to_owned()),
-                }
-            }
-            18 => {
-                let val = GeographyType::read_thrift(&mut *prot)?;
-                Self::Geography {
-                    crs: val.crs.map(|s| s.to_owned()),
-                    algorithm: val.algorithm,
-                }
-            }
-            _ => {
-                prot.skip(field_ident.field_type)?;
-                Self::_Unknown {
-                    field_id: field_ident.id,
-                }
-            }
-        };
-        let field_ident = prot.read_field_begin(field_ident.id)?;
-        if field_ident.field_type != FieldType::Stop {
-            return Err(general_err!(
-                "Received multiple fields for union from remote LogicalType"
-            ));
-        }
-        Ok(ret)
-    }
-}
-
-impl WriteThrift for LogicalType {
-    const ELEMENT_TYPE: ElementType = ElementType::Struct;
-
-    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
-        match self {
-            Self::String => {
-                writer.write_empty_struct(1, 0)?;
-            }
-            Self::Map => {
-                writer.write_empty_struct(2, 0)?;
-            }
-            Self::List => {
-                writer.write_empty_struct(3, 0)?;
-            }
-            Self::Enum => {
-                writer.write_empty_struct(4, 0)?;
-            }
-            Self::Decimal { scale, precision } => {
-                DecimalType {
-                    scale: *scale,
-                    precision: *precision,
-                }
-                .write_thrift_field(writer, 5, 0)?;
-            }
-            Self::Date => {
-                writer.write_empty_struct(6, 0)?;
-            }
-            Self::Time {
-                is_adjusted_to_u_t_c,
-                unit,
-            } => {
-                TimeType {
-                    is_adjusted_to_u_t_c: *is_adjusted_to_u_t_c,
-                    unit: *unit,
-                }
-                .write_thrift_field(writer, 7, 0)?;
-            }
-            Self::Timestamp {
-                is_adjusted_to_u_t_c,
-                unit,
-            } => {
-                TimestampType {
-                    is_adjusted_to_u_t_c: *is_adjusted_to_u_t_c,
-                    unit: *unit,
-                }
-                .write_thrift_field(writer, 8, 0)?;
-            }
-            Self::Integer {
-                bit_width,
-                is_signed,
-            } => {
-                IntType {
-                    bit_width: *bit_width,
-                    is_signed: *is_signed,
-                }
-                .write_thrift_field(writer, 10, 0)?;
-            }
-            Self::Unknown => {
-                writer.write_empty_struct(11, 0)?;
-            }
-            Self::Json => {
-                writer.write_empty_struct(12, 0)?;
-            }
-            Self::Bson => {
-                writer.write_empty_struct(13, 0)?;
-            }
-            Self::Uuid => {
-                writer.write_empty_struct(14, 0)?;
-            }
-            Self::Float16 => {
-                writer.write_empty_struct(15, 0)?;
-            }
-            Self::Variant {
-                specification_version,
-            } => {
-                VariantType {
-                    specification_version: *specification_version,
-                }
-                .write_thrift_field(writer, 16, 0)?;
-            }
-            Self::Geometry { crs } => {
-                GeometryType {
-                    crs: crs.as_ref().map(|s| s.as_str()),
-                }
-                .write_thrift_field(writer, 17, 0)?;
-            }
-            Self::Geography { crs, algorithm } => {
-                GeographyType {
-                    crs: crs.as_ref().map(|s| s.as_str()),
-                    algorithm: *algorithm,
-                }
-                .write_thrift_field(writer, 18, 0)?;
-            }
-            _ => return Err(nyi_err!("logical type")),
-        }
-        writer.write_struct_end()
-    }
-}
-
-impl WriteThriftField for LogicalType {
-    fn write_thrift_field<W: Write>(
-        &self,
-        writer: &mut ThriftCompactOutputProtocol<W>,
-        field_id: i16,
-        last_field_id: i16,
-    ) -> Result<i16> {
-        writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
-        self.write_thrift(writer)?;
-        Ok(field_id)
-    }
-}
+);
 
 // ----------------------------------------------------------------------
 // Mirrors thrift enum `FieldRepetitionType`
@@ -1034,7 +762,7 @@ impl ColumnOrder {
                 LogicalType::String | LogicalType::Enum | LogicalType::Json | LogicalType::Bson => {
                     SortOrder::UNSIGNED
                 }
-                LogicalType::Integer { is_signed, .. } => match is_signed {
+                LogicalType::Integer(int_type) => match int_type.is_signed {
                     true => SortOrder::SIGNED,
                     false => SortOrder::UNSIGNED,
                 },
@@ -1046,9 +774,9 @@ impl ColumnOrder {
                 LogicalType::Unknown => SortOrder::UNDEFINED,
                 LogicalType::Uuid => SortOrder::UNSIGNED,
                 LogicalType::Float16 => SortOrder::SIGNED,
-                LogicalType::Variant { .. }
-                | LogicalType::Geometry { .. }
-                | LogicalType::Geography { .. }
+                LogicalType::Variant(_)
+                | LogicalType::Geometry(_)
+                | LogicalType::Geography(_)
                 | LogicalType::_Unknown { .. } => SortOrder::UNDEFINED,
             },
             // Fall back to converted type
@@ -1213,20 +941,17 @@ impl From<Option<LogicalType>> for ConvertedType {
                 LogicalType::Enum => ConvertedType::ENUM,
                 LogicalType::Decimal { .. } => ConvertedType::DECIMAL,
                 LogicalType::Date => ConvertedType::DATE,
-                LogicalType::Time { unit, .. } => match unit {
+                LogicalType::Time(time) => match time.unit {
                     TimeUnit::MILLIS => ConvertedType::TIME_MILLIS,
                     TimeUnit::MICROS => ConvertedType::TIME_MICROS,
                     TimeUnit::NANOS => ConvertedType::NONE,
                 },
-                LogicalType::Timestamp { unit, .. } => match unit {
+                LogicalType::Timestamp(time) => match time.unit {
                     TimeUnit::MILLIS => ConvertedType::TIMESTAMP_MILLIS,
                     TimeUnit::MICROS => ConvertedType::TIMESTAMP_MICROS,
                     TimeUnit::NANOS => ConvertedType::NONE,
                 },
-                LogicalType::Integer {
-                    bit_width,
-                    is_signed,
-                } => match (bit_width, is_signed) {
+                LogicalType::Integer(int_type) => match (int_type.bit_width, int_type.is_signed) {
                     (8, true) => ConvertedType::INT_8,
                     (16, true) => ConvertedType::INT_16,
                     (32, true) => ConvertedType::INT_32,
@@ -1327,26 +1052,26 @@ impl str::FromStr for LogicalType {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             // The type is a placeholder that gets updated elsewhere
-            "INTEGER" => Ok(LogicalType::Integer {
+            "INTEGER" => Ok(LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: false,
-            }),
+            })),
             "MAP" => Ok(LogicalType::Map),
             "LIST" => Ok(LogicalType::List),
             "ENUM" => Ok(LogicalType::Enum),
-            "DECIMAL" => Ok(LogicalType::Decimal {
+            "DECIMAL" => Ok(LogicalType::Decimal(DecimalType {
                 precision: -1,
                 scale: -1,
-            }),
+            })),
             "DATE" => Ok(LogicalType::Date),
-            "TIME" => Ok(LogicalType::Time {
+            "TIME" => Ok(LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MILLIS,
-            }),
-            "TIMESTAMP" => Ok(LogicalType::Timestamp {
+            })),
+            "TIMESTAMP" => Ok(LogicalType::Timestamp(TimestampType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MILLIS,
-            }),
+            })),
             "STRING" => Ok(LogicalType::String),
             "JSON" => Ok(LogicalType::Json),
             "BSON" => Ok(LogicalType::Bson),
@@ -1660,10 +1385,10 @@ mod tests {
         let logical_none: Option<LogicalType> = None;
         assert_eq!(ConvertedType::from(logical_none), ConvertedType::NONE);
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Decimal {
+            ConvertedType::from(Some(LogicalType::Decimal(DecimalType {
                 precision: 20,
                 scale: 5
-            })),
+            }))),
             ConvertedType::DECIMAL
         );
         assert_eq!(
@@ -1683,101 +1408,101 @@ mod tests {
             ConvertedType::DATE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
+            ConvertedType::from(Some(LogicalType::Time(TimeType {
                 unit: TimeUnit::MILLIS,
                 is_adjusted_to_u_t_c: true,
-            })),
+            }))),
             ConvertedType::TIME_MILLIS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
+            ConvertedType::from(Some(LogicalType::Time(TimeType {
                 unit: TimeUnit::MICROS,
                 is_adjusted_to_u_t_c: true,
-            })),
+            }))),
             ConvertedType::TIME_MICROS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
+            ConvertedType::from(Some(LogicalType::Time(TimeType {
                 unit: TimeUnit::NANOS,
                 is_adjusted_to_u_t_c: false,
-            })),
+            }))),
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
+            ConvertedType::from(Some(LogicalType::Timestamp(TimestampType {
                 unit: TimeUnit::MILLIS,
                 is_adjusted_to_u_t_c: true,
-            })),
+            }))),
             ConvertedType::TIMESTAMP_MILLIS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
+            ConvertedType::from(Some(LogicalType::Timestamp(TimestampType {
                 unit: TimeUnit::MICROS,
                 is_adjusted_to_u_t_c: false,
-            })),
+            }))),
             ConvertedType::TIMESTAMP_MICROS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
+            ConvertedType::from(Some(LogicalType::Timestamp(TimestampType {
                 unit: TimeUnit::NANOS,
                 is_adjusted_to_u_t_c: false,
-            })),
+            }))),
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: false
-            })),
+            }))),
             ConvertedType::UINT_8
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true
-            })),
+            }))),
             ConvertedType::INT_8
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 16,
                 is_signed: false
-            })),
+            }))),
             ConvertedType::UINT_16
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 16,
                 is_signed: true
-            })),
+            }))),
             ConvertedType::INT_16
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 32,
                 is_signed: false
-            })),
+            }))),
             ConvertedType::UINT_32
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 32,
                 is_signed: true
-            })),
+            }))),
             ConvertedType::INT_32
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 64,
                 is_signed: false
-            })),
+            }))),
             ConvertedType::UINT_64
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
+            ConvertedType::from(Some(LogicalType::Integer(IntType {
                 bit_width: 64,
                 is_signed: true
-            })),
+            }))),
             ConvertedType::INT_64
         );
         assert_eq!(
@@ -1812,81 +1537,81 @@ mod tests {
         test_roundtrip(LogicalType::Map);
         test_roundtrip(LogicalType::List);
         test_roundtrip(LogicalType::Enum);
-        test_roundtrip(LogicalType::Decimal {
+        test_roundtrip(LogicalType::Decimal(DecimalType {
             scale: 0,
             precision: 20,
-        });
+        }));
         test_roundtrip(LogicalType::Date);
-        test_roundtrip(LogicalType::Time {
+        test_roundtrip(LogicalType::Time(TimeType {
             is_adjusted_to_u_t_c: true,
             unit: TimeUnit::MICROS,
-        });
-        test_roundtrip(LogicalType::Time {
+        }));
+        test_roundtrip(LogicalType::Time(TimeType {
             is_adjusted_to_u_t_c: false,
             unit: TimeUnit::MILLIS,
-        });
-        test_roundtrip(LogicalType::Time {
+        }));
+        test_roundtrip(LogicalType::Time(TimeType {
             is_adjusted_to_u_t_c: false,
             unit: TimeUnit::NANOS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
+        }));
+        test_roundtrip(LogicalType::Timestamp(TimestampType {
             is_adjusted_to_u_t_c: false,
             unit: TimeUnit::MICROS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
+        }));
+        test_roundtrip(LogicalType::Timestamp(TimestampType {
             is_adjusted_to_u_t_c: true,
             unit: TimeUnit::MILLIS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
+        }));
+        test_roundtrip(LogicalType::Timestamp(TimestampType {
             is_adjusted_to_u_t_c: true,
             unit: TimeUnit::NANOS,
-        });
-        test_roundtrip(LogicalType::Integer {
+        }));
+        test_roundtrip(LogicalType::Integer(IntType {
             bit_width: 8,
             is_signed: true,
-        });
-        test_roundtrip(LogicalType::Integer {
+        }));
+        test_roundtrip(LogicalType::Integer(IntType {
             bit_width: 16,
             is_signed: false,
-        });
-        test_roundtrip(LogicalType::Integer {
+        }));
+        test_roundtrip(LogicalType::Integer(IntType {
             bit_width: 32,
             is_signed: true,
-        });
-        test_roundtrip(LogicalType::Integer {
+        }));
+        test_roundtrip(LogicalType::Integer(IntType {
             bit_width: 64,
             is_signed: false,
-        });
+        }));
         test_roundtrip(LogicalType::Json);
         test_roundtrip(LogicalType::Bson);
         test_roundtrip(LogicalType::Uuid);
         test_roundtrip(LogicalType::Float16);
-        test_roundtrip(LogicalType::Variant {
+        test_roundtrip(LogicalType::Variant(VariantType {
             specification_version: Some(1),
-        });
-        test_roundtrip(LogicalType::Variant {
+        }));
+        test_roundtrip(LogicalType::Variant(VariantType {
             specification_version: None,
-        });
-        test_roundtrip(LogicalType::Geometry {
+        }));
+        test_roundtrip(LogicalType::Geometry(GeometryType {
             crs: Some("foo".to_owned()),
-        });
-        test_roundtrip(LogicalType::Geometry { crs: None });
-        test_roundtrip(LogicalType::Geography {
+        }));
+        test_roundtrip(LogicalType::Geometry(GeometryType { crs: None }));
+        test_roundtrip(LogicalType::Geography(GeographyType {
             crs: Some("foo".to_owned()),
             algorithm: Some(EdgeInterpolationAlgorithm::ANDOYER),
-        });
-        test_roundtrip(LogicalType::Geography {
+        }));
+        test_roundtrip(LogicalType::Geography(GeographyType {
             crs: None,
             algorithm: Some(EdgeInterpolationAlgorithm::KARNEY),
-        });
-        test_roundtrip(LogicalType::Geography {
+        }));
+        test_roundtrip(LogicalType::Geography(GeographyType {
             crs: Some("foo".to_owned()),
             algorithm: None,
-        });
-        test_roundtrip(LogicalType::Geography {
+        }));
+        test_roundtrip(LogicalType::Geography(GeographyType {
             crs: None,
             algorithm: None,
-        });
+        }));
     }
 
     #[test]
@@ -2026,72 +1751,72 @@ mod tests {
             LogicalType::Bson,
             LogicalType::Enum,
             LogicalType::Uuid,
-            LogicalType::Integer {
+            LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: false,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 16,
                 is_signed: false,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 32,
                 is_signed: false,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 64,
                 is_signed: false,
-            },
+            }),
         ];
         check_sort_order(unsigned, SortOrder::UNSIGNED);
 
         // Signed comparison (physical type does not matter)
         let signed = vec![
-            LogicalType::Integer {
+            LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true,
-            },
-            LogicalType::Integer {
+            }),
+            LogicalType::Integer(IntType {
                 bit_width: 8,
                 is_signed: true,
-            },
-            LogicalType::Decimal {
+            }),
+            LogicalType::Decimal(DecimalType {
                 scale: 20,
                 precision: 4,
-            },
+            }),
             LogicalType::Date,
-            LogicalType::Time {
+            LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MILLIS,
-            },
-            LogicalType::Time {
+            }),
+            LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MICROS,
-            },
-            LogicalType::Time {
+            }),
+            LogicalType::Time(TimeType {
                 is_adjusted_to_u_t_c: true,
                 unit: TimeUnit::NANOS,
-            },
-            LogicalType::Timestamp {
+            }),
+            LogicalType::Timestamp(TimestampType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MILLIS,
-            },
-            LogicalType::Timestamp {
+            }),
+            LogicalType::Timestamp(TimestampType {
                 is_adjusted_to_u_t_c: false,
                 unit: TimeUnit::MICROS,
-            },
-            LogicalType::Timestamp {
+            }),
+            LogicalType::Timestamp(TimestampType {
                 is_adjusted_to_u_t_c: true,
                 unit: TimeUnit::NANOS,
-            },
+            }),
             LogicalType::Float16,
         ];
         check_sort_order(signed, SortOrder::SIGNED);

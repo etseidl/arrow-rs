@@ -174,7 +174,7 @@ pub fn parquet_record_writer(input: proc_macro::TokenStream) -> proc_macro::Toke
       fn schema(&self) -> ::std::result::Result<::parquet::schema::types::TypePtr, ::parquet::errors::ParquetError> {
         use ::parquet::schema::types::Type as ParquetType;
         use ::parquet::schema::types::TypePtr;
-        use ::parquet::basic::LogicalType;
+        use ::parquet::basic::{IntType, LogicalType};
 
         let mut fields: ::std::vec::Vec<TypePtr> = ::std::vec::Vec::new();
         #(

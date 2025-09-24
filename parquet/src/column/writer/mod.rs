@@ -27,7 +27,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::str;
 
 use crate::basic::{
-    BoundaryOrder, Compression, ConvertedType, Encoding, LogicalType, PageType, Type,
+    BoundaryOrder, Compression, ConvertedType, Encoding, IntType, LogicalType, PageType, Type,
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
 use crate::column::writer::encoder::{ColumnValueEncoder, ColumnValueEncoderImpl, ColumnValues};
@@ -1414,9 +1414,9 @@ fn update_stat<T: ParquetValueType, F>(
 fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) -> bool {
     match T::PHYSICAL_TYPE {
         Type::INT32 | Type::INT64 => {
-            if let Some(LogicalType::Integer {
+            if let Some(LogicalType::Integer(IntType {
                 is_signed: false, ..
-            }) = descr.logical_type()
+            })) = descr.logical_type()
             {
                 // need to compare unsigned
                 return compare_greater_unsigned_int(a, b);
@@ -1602,6 +1602,7 @@ fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use crate::{
+        basic::DecimalType,
         file::{properties::DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, writer::SerializedFileWriter},
         schema::parser::parse_message_type,
     };
@@ -4199,10 +4200,10 @@ mod tests {
         let path = ColumnPath::from("col");
         let tpe = SchemaType::primitive_type_builder("col", T::get_physical_type())
             .with_length(16)
-            .with_logical_type(Some(LogicalType::Decimal {
+            .with_logical_type(Some(LogicalType::Decimal(DecimalType {
                 scale: 2,
                 precision: 3,
-            }))
+            })))
             .with_scale(2)
             .with_precision(3)
             .build()
