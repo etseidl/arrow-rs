@@ -431,7 +431,7 @@ impl<'a, W: Write> ParquetMetaDataWriter<'a, W> {
     }
 
     fn convert_column_indexes(&self) -> Option<Vec<Vec<Option<ColumnIndexMetaData>>>> {
-        // FIXME(ets): we're converting from ParquetColumnIndex to vec<vec<option>>,
+        // TODO(ets): we're converting from ParquetColumnIndex to vec<vec<option>>,
         // but then converting back to ParquetColumnIndex in the end. need to unify this.
         self.metadata
             .column_index()
@@ -662,6 +662,8 @@ impl MetadataObjectWriter {
         };
 
         if file_encryptor.is_column_encrypted(column_path) {
+            use crate::encryption::encrypt::encrypt_thrift_object;
+
             let aad = create_module_aad(
                 file_encryptor.file_aad(),
                 module_type,
@@ -774,8 +776,6 @@ impl MetadataObjectWriter {
                 }
                 let ciphertext = column_encryptor.encrypt(&buffer, &aad)?;
 
-                // TODO: remember to not serialize column meta data if encrypted_column_metadata
-                // is Some
                 column_chunk.encrypted_column_metadata = Some(ciphertext);
             }
         }

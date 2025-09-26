@@ -38,7 +38,7 @@
 //! metadata into parquet files. To work with metadata directly,
 //! the following APIs are available:
 //!
-//! * [`ParquetMetaDataReader`] for reading from a reader for I/O
+//! * [`ParquetMetaDataReader`] for reading metadata from an I/O source (sync and async)
 //! * [`ParquetMetaDataPushDecoder`] for decoding from bytes without I/O
 //! * [`ParquetMetaDataWriter`] for writing.
 //!
@@ -87,7 +87,9 @@
 //!
 //!                         * Same name, different struct
 //! ```
+mod footer_tail;
 mod memory;
+mod parser;
 mod push_decoder;
 pub(crate) mod reader;
 pub(crate) mod thrift_gen;
@@ -122,8 +124,9 @@ use crate::{
     data_type::private::ParquetValueType, file::page_index::offset_index::OffsetIndexMetaData,
 };
 
+pub use footer_tail::FooterTail;
 pub use push_decoder::ParquetMetaDataPushDecoder;
-pub use reader::{FooterTail, PageIndexPolicy, ParquetMetaDataReader};
+pub use reader::{PageIndexPolicy, ParquetMetaDataReader};
 use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
@@ -200,10 +203,10 @@ impl ParquetMetaData {
         ParquetMetaData {
             file_metadata,
             row_groups,
-            #[cfg(feature = "encryption")]
-            file_decryptor: None,
             column_index: None,
             offset_index: None,
+            #[cfg(feature = "encryption")]
+            file_decryptor: None,
         }
     }
 
@@ -420,7 +423,6 @@ impl From<ParquetMetaData> for ParquetMetaDataBuilder {
     }
 }
 
-// TODO(ets): should this move to thrift_gen?
 thrift_struct!(
 /// A key-value pair for [`FileMetaData`].
 pub struct KeyValue {
