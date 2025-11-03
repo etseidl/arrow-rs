@@ -1247,7 +1247,7 @@ mod tests {
         FloatType, Int32Type, Int64Type, Int96, Int96Type,
     };
     use crate::errors::Result;
-    use crate::file::metadata::ParquetMetaData;
+    use crate::file::metadata::{MetadataOptions, ParquetMetaData};
     use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
     use crate::file::writer::SerializedFileWriter;
     use crate::schema::parser::parse_message_type;
