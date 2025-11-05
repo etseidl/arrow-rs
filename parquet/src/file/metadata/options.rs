@@ -29,6 +29,7 @@ use crate::schema::types::SchemaDescPtr;
 #[derive(Default, Debug, Clone)]
 pub struct ParquetMetaDataOptions {
     schema_descr: Option<SchemaDescPtr>,
+    encoding_stats_as_mask: bool,
 }
 
 impl ParquetMetaDataOptions {
@@ -50,7 +51,27 @@ impl ParquetMetaDataOptions {
 
     /// Provide a schema to use when decoding the metadata. Returns `Self` for chaining.
     pub fn with_schema(mut self, val: SchemaDescPtr) -> Self {
-        self.schema_descr = Some(val);
+        self.set_schema(val);
+        self
+    }
+
+    /// Returns whether to present the `encoding_stats` field of the `ColumnMetaData` as a
+    /// bitmask.
+    pub fn encoding_stats_as_mask(&self) -> bool {
+        self.encoding_stats_as_mask
+    }
+
+    /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
+    /// speed up metadata decoding while still enabling some use cases served by the full stats.
+    pub fn set_encoding_stats_as_mask(&mut self, val: bool) {
+        self.encoding_stats_as_mask = val;
+    }
+
+    /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
+    /// speed up metadata decoding while still enabling some use cases served by the full stats.
+    /// Returns `Self` for chaining.
+    pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
+        self.set_encoding_stats_as_mask(val);
         self
     }
 }

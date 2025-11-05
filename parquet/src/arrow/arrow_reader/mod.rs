@@ -537,6 +537,12 @@ impl ArrowReaderOptions {
         self
     }
 
+    /// Set whether to convert `encoding_stats` to a bitmask.
+    pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
+        self.metadata_options.set_encoding_stats_as_mask(val);
+        self
+    }
+
     /// Provide the file decryption properties to use when reading encrypted parquet files.
     ///
     /// If encryption is enabled and the file is encrypted, the `file_decryption_properties` must be provided.

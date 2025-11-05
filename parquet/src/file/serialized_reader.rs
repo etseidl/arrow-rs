@@ -160,6 +160,12 @@ impl ReadOptionsBuilder {
         self
     }
 
+    /// Set whether to convert `encoding_stats` to a bitmask.
+    pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
+        self.metadata_options.set_encoding_stats_as_mask(val);
+        self
+    }
+
     /// Seal the builder and return the read options
     pub fn build(self) -> ReadOptions {
         let props = self

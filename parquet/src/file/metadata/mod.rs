@@ -813,6 +813,7 @@ pub struct ColumnChunkMetaData {
     statistics: Option<Statistics>,
     geo_statistics: Option<Box<geo_statistics::GeospatialStatistics>>,
     encoding_stats: Option<Vec<PageEncodingStats>>,
+    encoding_stats_mask: Option<EncodingMask>,
     bloom_filter_offset: Option<i64>,
     bloom_filter_length: Option<i32>,
     offset_index_offset: Option<i64>,
@@ -1050,10 +1051,20 @@ impl ColumnChunkMetaData {
         self.geo_statistics.as_deref()
     }
 
-    /// Returns the offset for the page encoding stats,
+    /// Returns the page encoding stats,
     /// or `None` if no page encoding stats are available.
     pub fn page_encoding_stats(&self) -> Option<&Vec<PageEncodingStats>> {
         self.encoding_stats.as_ref()
+    }
+
+    /// Returns the page encoding stats reduced to a bitmask.
+    ///
+    /// Decoding the full page encoding statistics can be costly, and is not always necessary.
+    /// This field contains a mask of all encodings used for data pages. This can still support
+    /// some uses of the full statistics, such as determining if all data pages are dictionary
+    /// encoded.
+    pub fn page_encoding_stats_mask(&self) -> Option<&EncodingMask> {
+        self.encoding_stats_mask.as_ref()
     }
 
     /// Returns the offset for the bloom filter.
@@ -1178,6 +1189,7 @@ impl ColumnChunkMetaDataBuilder {
             statistics: None,
             geo_statistics: None,
             encoding_stats: None,
+            encoding_stats_mask: None,
             bloom_filter_offset: None,
             bloom_filter_length: None,
             offset_index_offset: None,
@@ -1275,6 +1287,12 @@ impl ColumnChunkMetaDataBuilder {
     /// Sets page encoding stats for this column chunk.
     pub fn set_page_encoding_stats(mut self, value: Vec<PageEncodingStats>) -> Self {
         self.0.encoding_stats = Some(value);
+        self
+    }
+
+    /// Sets page encoding stats mask for this column chunk.
+    pub fn set_page_encoding_stats_mask(mut self, value: EncodingMask) -> Self {
+        self.0.encoding_stats_mask = Some(value);
         self
     }
 
