@@ -166,6 +166,12 @@ impl ReadOptionsBuilder {
         self
     }
 
+    /// Set whether to skip decoding `encoding_stats`.
+    pub fn with_skip_encoding_stats(mut self, val: bool) -> Self {
+        self.metadata_options.set_skip_encoding_stats(val);
+        self
+    }
+
     /// Seal the builder and return the read options
     pub fn build(self) -> ReadOptions {
         let props = self

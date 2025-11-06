@@ -30,6 +30,7 @@ use crate::schema::types::SchemaDescPtr;
 pub struct ParquetMetaDataOptions {
     schema_descr: Option<SchemaDescPtr>,
     encoding_stats_as_mask: bool,
+    skip_encoding_stats: bool,
 }
 
 impl ParquetMetaDataOptions {
@@ -72,6 +73,22 @@ impl ParquetMetaDataOptions {
     /// Returns `Self` for chaining.
     pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
         self.set_encoding_stats_as_mask(val);
+        self
+    }
+
+    /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`.
+    pub fn skip_encoding_stats(&self) -> bool {
+        self.skip_encoding_stats
+    }
+
+    /// Skip decoding `encoding_stats`. Takes precedence over `encoding_stats_as_mask`.
+    pub fn set_skip_encoding_stats(&mut self, val: bool) {
+        self.skip_encoding_stats = val;
+    }
+
+    /// Skip decoding `encoding_stats`. Returns `Self` for chaining.
+    pub fn with_skip_encoding_stats(mut self, val: bool) -> Self {
+        self.set_skip_encoding_stats(val);
         self
     }
 }

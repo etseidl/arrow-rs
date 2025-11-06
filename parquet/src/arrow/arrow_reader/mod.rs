@@ -543,6 +543,12 @@ impl ArrowReaderOptions {
         self
     }
 
+    /// Set whether to skip decoding `encoding_stats`.
+    pub fn with_skip_encoding_stats(mut self, val: bool) -> Self {
+        self.metadata_options.set_skip_encoding_stats(val);
+        self
+    }
+
     /// Provide the file decryption properties to use when reading encrypted parquet files.
     ///
     /// If encryption is enabled and the file is encrypted, the `file_decryption_properties` must be provided.

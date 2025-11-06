@@ -408,6 +408,14 @@ fn read_column_metadata<'a>(
     // mask for seen required fields in ColumnMetaData
     let mut seen_mask = 0u16;
 
+    let mut skip_pes = false;
+    let mut pes_mask = false;
+
+    if let Some(opts) = options {
+        skip_pes = opts.skip_encoding_stats();
+        pes_mask = opts.encoding_stats_as_mask();
+    }
+
     // struct ColumnMetaData {
     //   1: required Type type
     //   2: required list<Encoding> encodings
@@ -479,7 +487,9 @@ fn read_column_metadata<'a>(
                     convert_stats(column_descr, Some(Statistics::read_thrift(&mut *prot)?))?;
             }
             13 => {
-                if options.is_some_and(|o| o.encoding_stats_as_mask()) {
+                if skip_pes {
+                    prot.skip(field_ident.field_type)?;
+                } else if pes_mask {
                     let val = read_encoding_stats_as_mask(&mut *prot)?;
                     column.encoding_stats_mask = Some(val);
                 } else {
