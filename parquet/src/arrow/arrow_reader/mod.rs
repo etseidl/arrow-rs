@@ -1295,6 +1295,57 @@ mod tests {
     }
 
     #[test]
+    fn test_page_encoding_stats_mask() {
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_tiny_pages.parquet");
+        let file = File::open(path).unwrap();
+
+        let arrow_options = ArrowReaderOptions::new().with_encoding_stats_as_mask(true);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new_with_options(file, arrow_options).unwrap();
+
+        let row_group_metadata = builder.metadata.row_group(0);
+
+        // test page encoding stats
+        let page_encoding_stats = row_group_metadata
+            .column(0)
+            .page_encoding_stats_mask()
+            .unwrap();
+        assert!(page_encoding_stats.is_set(Encoding::PLAIN));
+        // PLAIN = 0, so 1 << 0 or 1
+        assert_eq!(page_encoding_stats.as_i32() ^ 1, 0);
+        let page_encoding_stats = row_group_metadata
+            .column(2)
+            .page_encoding_stats_mask()
+            .unwrap();
+        assert!(page_encoding_stats.is_set(Encoding::PLAIN_DICTIONARY));
+        // PLAIN_DICTIONARY = 2, so 1 << 2
+        assert_eq!(page_encoding_stats.as_i32() ^ (1 << 2), 0);
+    }
+
+    #[test]
+    fn test_page_encoding_stats_skipped() {
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_tiny_pages.parquet");
+        let file = File::open(path).unwrap();
+
+        let arrow_options = ArrowReaderOptions::new().with_skip_encoding_stats(true);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new_with_options(file, arrow_options).unwrap();
+
+        let row_group_metadata = builder.metadata.row_group(0);
+
+        // test page encoding stats
+        assert!(row_group_metadata.column(0).page_encoding_stats().is_none());
+        assert!(
+            row_group_metadata
+                .column(0)
+                .page_encoding_stats_mask()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_arrow_reader_single_column() {
         let file = get_test_file("parquet/generated_simple_numerics/blogs.parquet");
 

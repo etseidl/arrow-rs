@@ -1870,6 +1870,53 @@ mod tests {
     }
 
     #[test]
+    fn test_file_reader_page_stats_mask() {
+        let file = get_test_file("alltypes_tiny_pages.parquet");
+        let options = ReadOptionsBuilder::new()
+            .with_encoding_stats_as_mask(true)
+            .build();
+        let file_reader = Arc::new(SerializedFileReader::new_with_options(file, options).unwrap());
+
+        let row_group_metadata = file_reader.metadata.row_group(0);
+
+        // test page encoding stats
+        let page_encoding_stats = row_group_metadata
+            .column(0)
+            .page_encoding_stats_mask()
+            .unwrap();
+        assert!(page_encoding_stats.is_set(Encoding::PLAIN));
+        // PLAIN = 0, so 1 << 0 or 1
+        assert_eq!(page_encoding_stats.as_i32() ^ 1, 0);
+        let page_encoding_stats = row_group_metadata
+            .column(2)
+            .page_encoding_stats_mask()
+            .unwrap();
+        assert!(page_encoding_stats.is_set(Encoding::PLAIN_DICTIONARY));
+        // PLAIN_DICTIONARY = 2, so 1 << 2
+        assert_eq!(page_encoding_stats.as_i32() ^ (1 << 2), 0);
+    }
+
+    #[test]
+    fn test_file_reader_page_stats_skipped() {
+        let file = get_test_file("alltypes_tiny_pages.parquet");
+        let options = ReadOptionsBuilder::new()
+            .with_skip_encoding_stats(true)
+            .build();
+        let file_reader = Arc::new(SerializedFileReader::new_with_options(file, options).unwrap());
+
+        let row_group_metadata = file_reader.metadata.row_group(0);
+
+        // test page encoding stats
+        assert!(row_group_metadata.column(0).page_encoding_stats().is_none());
+        assert!(
+            row_group_metadata
+                .column(0)
+                .page_encoding_stats_mask()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_file_reader_with_no_filter() -> Result<()> {
         let test_file = get_test_file("alltypes_plain.parquet");
         let origin_reader = SerializedFileReader::new(test_file)?;
