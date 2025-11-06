@@ -486,10 +486,8 @@ fn read_column_metadata<'a>(
                 column.statistics =
                     convert_stats(column_descr, Some(Statistics::read_thrift(&mut *prot)?))?;
             }
-            13 => {
-                if skip_pes {
-                    prot.skip(field_ident.field_type)?;
-                } else if pes_mask {
+            13 if !skip_pes => {
+                if pes_mask {
                     let val = read_encoding_stats_as_mask(&mut *prot)?;
                     column.encoding_stats_mask = Some(val);
                 } else {
