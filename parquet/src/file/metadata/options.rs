@@ -64,6 +64,8 @@ impl ParquetMetaDataOptions {
 
     /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
     /// speed up metadata decoding while still enabling some use cases served by the full stats.
+    ///
+    /// [`PageEncodingStats`]: crate::file::metadata::PageEncodingStats
     pub fn set_encoding_stats_as_mask(&mut self, val: bool) {
         self.encoding_stats_as_mask = val;
     }
@@ -71,6 +73,8 @@ impl ParquetMetaDataOptions {
     /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
     /// speed up metadata decoding while still enabling some use cases served by the full stats.
     /// Returns `Self` for chaining.
+    ///
+    /// [`PageEncodingStats`]: crate::file::metadata::PageEncodingStats
     pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
         self.set_encoding_stats_as_mask(val);
         self
