@@ -17,6 +17,7 @@
 
 //! Options used to control metadata parsing
 
+use paste::paste;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -39,6 +40,19 @@ pub struct ParquetMetaDataOptions {
     skip_encoding_stats: Option<Option<Arc<HashSet<usize>>>>,
 }
 
+// wraps `set_X` with a `with_X` function that returns `Self`
+macro_rules! add_mutator {
+    ($name:expr, $type:ty) => {
+        paste! {
+            #[doc = concat!("Call [`Self::set_", stringify!($name), "`] and return `Self` for chaining.")]
+            pub fn [<with_ $name>](mut self, val: $type) -> Self {
+                self.[<set_ $name>](val);
+                self
+            }
+        }
+    }
+}
+
 impl ParquetMetaDataOptions {
     /// Return a new default [`ParquetMetaDataOptions`].
     pub fn new() -> Self {
@@ -56,11 +70,7 @@ impl ParquetMetaDataOptions {
         self.schema_descr = Some(val);
     }
 
-    /// Provide a schema to use when decoding the metadata. Returns `Self` for chaining.
-    pub fn with_schema(mut self, val: SchemaDescPtr) -> Self {
-        self.set_schema(val);
-        self
-    }
+    add_mutator!(schema, SchemaDescPtr);
 
     /// Returns whether to present the `encoding_stats` field of the `ColumnMetaData` as a
     /// bitmask.
@@ -76,15 +86,7 @@ impl ParquetMetaDataOptions {
         self.encoding_stats_as_mask = val;
     }
 
-    /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
-    /// speed up metadata decoding while still enabling some use cases served by the full stats.
-    /// Returns `Self` for chaining.
-    ///
-    /// [`PageEncodingStats`]: crate::file::metadata::PageEncodingStats
-    pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
-        self.set_encoding_stats_as_mask(val);
-        self
-    }
+    add_mutator!(encoding_stats_as_mask, bool);
 
     /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`
     /// for the column indexed by `col_index`.
@@ -101,11 +103,7 @@ impl ParquetMetaDataOptions {
         self.skip_encoding_stats = if val { Some(None) } else { None };
     }
 
-    /// Skip decoding of all `encoding_stats`. Returns `Self` for chaining.
-    pub fn with_skip_encoding_stats(mut self, val: bool) -> Self {
-        self.set_skip_encoding_stats(val);
-        self
-    }
+    add_mutator!(skip_encoding_stats, bool);
 
     /// Skip decoding of `encoding_stats`, but decode the stats for those column in
     /// provided list of column indices.
@@ -119,12 +117,7 @@ impl ParquetMetaDataOptions {
         }
     }
 
-    /// Skip decoding of `encoding_stats`, but decode the stats for those column in
-    /// provided list of column indices. Returns `Self` for chaining.
-    pub fn with_keep_encoding_stats(mut self, keep: &[usize]) -> Self {
-        self.set_keep_encoding_stats(keep);
-        self
-    }
+    add_mutator!(keep_encoding_stats, &[usize]);
 }
 
 #[cfg(test)]
