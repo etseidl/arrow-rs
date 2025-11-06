@@ -177,7 +177,7 @@ fn row_group_from_encrypted_thrift(
 
             // parse decrypted buffer and then replace fields in 'c'
             let mut prot = ThriftSliceInputProtocol::new(&decrypted_cc_buf);
-            let mask = read_column_metadata(&mut prot, &mut c, options)?;
+            let mask = read_column_metadata(&mut prot, &mut c, i, options)?;
             validate_column_metadata(mask)?;
 
             columns.push(c);

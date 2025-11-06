@@ -403,6 +403,7 @@ fn read_encoding_stats_as_mask<'a>(
 fn read_column_metadata<'a>(
     prot: &mut ThriftSliceInputProtocol<'a>,
     column: &mut ColumnChunkMetaData,
+    col_index: usize,
     options: Option<&ParquetMetaDataOptions>,
 ) -> Result<u16> {
     // mask for seen required fields in ColumnMetaData
@@ -412,7 +413,7 @@ fn read_column_metadata<'a>(
     let mut pes_mask = false;
 
     if let Some(opts) = options {
-        skip_pes = opts.skip_encoding_stats();
+        skip_pes = opts.skip_encoding_stats(col_index);
         pes_mask = opts.encoding_stats_as_mask();
     }
 
@@ -529,6 +530,7 @@ fn read_column_metadata<'a>(
 fn read_column_chunk<'a>(
     prot: &mut ThriftSliceInputProtocol<'a>,
     column_descr: &Arc<ColumnDescriptor>,
+    col_index: usize,
     options: Option<&ParquetMetaDataOptions>,
 ) -> Result<ColumnChunkMetaData> {
     // create a default initialized ColumnMetaData
@@ -566,7 +568,7 @@ fn read_column_chunk<'a>(
                 has_file_offset = true;
             }
             3 => {
-                col_meta_mask = read_column_metadata(&mut *prot, &mut col, options)?;
+                col_meta_mask = read_column_metadata(&mut *prot, &mut col, col_index, options)?;
             }
             4 => {
                 col.offset_index_offset = Some(i64::read_thrift(&mut *prot)?);
@@ -655,7 +657,7 @@ fn read_row_group(
                     ));
                 }
                 for i in 0..list_ident.size as usize {
-                    let col = read_column_chunk(prot, &schema_descr.columns()[i], options)?;
+                    let col = read_column_chunk(prot, &schema_descr.columns()[i], i, options)?;
                     row_group.columns.push(col);
                 }
                 mask |= RG_COLUMNS;
@@ -1665,7 +1667,7 @@ pub(crate) mod tests {
         column_descr: Arc<ColumnDescriptor>,
     ) -> Result<ColumnChunkMetaData> {
         let mut reader = ThriftSliceInputProtocol::new(buf);
-        crate::file::metadata::thrift::read_column_chunk(&mut reader, &column_descr, None)
+        crate::file::metadata::thrift::read_column_chunk(&mut reader, &column_descr, 0, None)
     }
 
     pub(crate) fn roundtrip_schema(schema: TypePtr) -> Result<TypePtr> {

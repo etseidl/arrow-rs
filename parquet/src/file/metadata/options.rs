@@ -17,6 +17,9 @@
 
 //! Options used to control metadata parsing
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::schema::types::SchemaDescPtr;
 
 /// Options that can be set to control what parts of the Parquet file footer
@@ -30,7 +33,10 @@ use crate::schema::types::SchemaDescPtr;
 pub struct ParquetMetaDataOptions {
     schema_descr: Option<SchemaDescPtr>,
     encoding_stats_as_mask: bool,
-    skip_encoding_stats: bool,
+    // The outer option acts as a global boolean, so if `skip_encoding_stats.is_some()`
+    // is `true` then we're at least skipping some stats. The inner `Option` is a keep
+    // list of column indicies to decode.
+    skip_encoding_stats: Option<Option<Arc<HashSet<usize>>>>,
 }
 
 impl ParquetMetaDataOptions {
@@ -80,19 +86,43 @@ impl ParquetMetaDataOptions {
         self
     }
 
-    /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`.
-    pub fn skip_encoding_stats(&self) -> bool {
+    /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`
+    /// for the column indexed by `col_index`.
+    ///
+    /// `true` means at least some columns will have their stats skipped.
+    pub fn skip_encoding_stats(&self, col_index: usize) -> bool {
         self.skip_encoding_stats
+            .as_ref()
+            .is_some_and(|oset| oset.as_ref().is_none_or(|keep| !keep.contains(&col_index)))
     }
 
-    /// Skip decoding `encoding_stats`. Takes precedence over `encoding_stats_as_mask`.
+    /// Skip decoding of all `encoding_stats`. Takes precedence over `encoding_stats_as_mask`.
     pub fn set_skip_encoding_stats(&mut self, val: bool) {
-        self.skip_encoding_stats = val;
+        self.skip_encoding_stats = if val { Some(None) } else { None };
     }
 
-    /// Skip decoding `encoding_stats`. Returns `Self` for chaining.
+    /// Skip decoding of all `encoding_stats`. Returns `Self` for chaining.
     pub fn with_skip_encoding_stats(mut self, val: bool) -> Self {
         self.set_skip_encoding_stats(val);
+        self
+    }
+
+    /// Skip decoding of `encoding_stats`, but decode the stats for those column in
+    /// provided list of column indices.
+    pub fn set_keep_encoding_stats(&mut self, keep: &[usize]) {
+        if keep.is_empty() {
+            self.set_skip_encoding_stats(true);
+        } else {
+            let mut keep_set = HashSet::<usize>::with_capacity(keep.len());
+            keep_set.extend(keep.iter());
+            self.skip_encoding_stats = Some(Some(Arc::new(keep_set)))
+        }
+    }
+
+    /// Skip decoding of `encoding_stats`, but decode the stats for those column in
+    /// provided list of column indices. Returns `Self` for chaining.
+    pub fn with_keep_encoding_stats(mut self, keep: &[usize]) -> Self {
+        self.set_keep_encoding_stats(keep);
         self
     }
 }

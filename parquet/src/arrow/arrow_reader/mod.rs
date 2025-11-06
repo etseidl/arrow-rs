@@ -549,6 +549,12 @@ impl ArrowReaderOptions {
         self
     }
 
+    /// Provide a list of column indicies for which to decode `encoding_stats`.
+    pub fn with_keep_encoding_stats(mut self, keep: &[usize]) -> Self {
+        self.metadata_options.set_keep_encoding_stats(keep);
+        self
+    }
+
     /// Provide the file decryption properties to use when reading encrypted parquet files.
     ///
     /// If encryption is enabled and the file is encrypted, the `file_decryption_properties` must be provided.
@@ -1329,20 +1335,35 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages.parquet");
         let file = File::open(path).unwrap();
 
+        // test skipping all
         let arrow_options = ArrowReaderOptions::new().with_skip_encoding_stats(true);
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new_with_options(file, arrow_options).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            file.try_clone().unwrap(),
+            arrow_options,
+        )
+        .unwrap();
 
         let row_group_metadata = builder.metadata.row_group(0);
+        for column in row_group_metadata.columns() {
+            assert!(column.page_encoding_stats().is_none());
+            assert!(column.page_encoding_stats_mask().is_none());
+        }
 
-        // test page encoding stats
-        assert!(row_group_metadata.column(0).page_encoding_stats().is_none());
-        assert!(
-            row_group_metadata
-                .column(0)
-                .page_encoding_stats_mask()
-                .is_none()
-        );
+        // test skipping all but one column and converting to mask
+        let arrow_options = ArrowReaderOptions::new()
+            .with_encoding_stats_as_mask(true)
+            .with_keep_encoding_stats(&[0]);
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            file.try_clone().unwrap(),
+            arrow_options,
+        )
+        .unwrap();
+
+        let row_group_metadata = builder.metadata.row_group(0);
+        for (idx, column) in row_group_metadata.columns().iter().enumerate() {
+            assert!(column.page_encoding_stats().is_none());
+            assert_eq!(column.page_encoding_stats_mask().is_some(), idx == 0);
+        }
     }
 
     #[test]
