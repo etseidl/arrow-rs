@@ -102,8 +102,6 @@ impl ParquetMetaDataOptions {
 
     /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`
     /// for the column indexed by `col_index`.
-    ///
-    /// `true` means at least some columns will have their stats skipped.
     pub fn skip_encoding_stats(&self, col_index: usize) -> bool {
         self.skip_encoding_stats
             .as_ref()
