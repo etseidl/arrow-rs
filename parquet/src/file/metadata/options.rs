@@ -75,6 +75,12 @@ impl ParquetMetaDataOptions {
 
     /// Returns whether to present the `encoding_stats` field of the `ColumnMetaData` as a
     /// bitmask.
+    ///
+    /// See [`ColumnChunkMetaData::page_encoding_stats_mask`] for an explanation of why this
+    /// might be desirable.
+    ///
+    /// [`ColumnChunkMetaData::page_encoding_stats_mask`]:
+    /// crate::file::metadata::ColumnChunkMetaData::page_encoding_stats_mask
     pub fn encoding_stats_as_mask(&self) -> bool {
         self.encoding_stats_as_mask
     }
@@ -82,7 +88,11 @@ impl ParquetMetaDataOptions {
     /// Convert `encoding_stats` from a vector of [`PageEncodingStats`] to a bitmask. This can
     /// speed up metadata decoding while still enabling some use cases served by the full stats.
     ///
+    /// See [`ColumnChunkMetaData::page_encoding_stats_mask`] for more information.
+    ///
     /// [`PageEncodingStats`]: crate::file::metadata::PageEncodingStats
+    /// [`ColumnChunkMetaData::page_encoding_stats_mask`]:
+    /// crate::file::metadata::ColumnChunkMetaData::page_encoding_stats_mask
     pub fn set_encoding_stats_as_mask(&mut self, val: bool) {
         self.encoding_stats_as_mask = val;
     }
@@ -100,7 +110,8 @@ impl ParquetMetaDataOptions {
             .is_some_and(|oset| oset.as_ref().is_none_or(|keep| !keep.contains(&col_index)))
     }
 
-    /// Skip decoding of all `encoding_stats`. Takes precedence over `encoding_stats_as_mask`.
+    /// Skip decoding of all `encoding_stats`. Takes precedence over
+    /// [`Self::encoding_stats_as_mask`].
     pub fn set_skip_encoding_stats(&mut self, val: bool) {
         self.skip_encoding_stats = if val { Some(None) } else { None };
     }
@@ -108,8 +119,11 @@ impl ParquetMetaDataOptions {
     // with_skip_encoding_stats
     add_mutator!(skip_encoding_stats, bool);
 
-    /// Skip decoding of `encoding_stats`, but decode the stats for those column in
-    /// provided list of column indices.
+    /// Skip decoding of `encoding_stats`, but decode the stats for those columns in
+    /// the provided list of column indices.
+    ///
+    /// This allows for optimizations such as only decoding the page encoding statistics
+    /// for columns present in a predicate.
     pub fn set_keep_encoding_stats(&mut self, keep: &[usize]) {
         if keep.is_empty() {
             self.set_skip_encoding_stats(true);

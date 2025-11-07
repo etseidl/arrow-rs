@@ -538,6 +538,12 @@ impl ArrowReaderOptions {
     }
 
     /// Set whether to convert `encoding_stats` to a bitmask.
+    ///
+    /// See [`ColumnChunkMetaData::page_encoding_stats_mask`] for an explanation of why this
+    /// might be desirable.
+    ///
+    /// [`ColumnChunkMetaData::page_encoding_stats_mask`]:
+    /// crate::file::metadata::ColumnChunkMetaData::page_encoding_stats_mask
     pub fn with_encoding_stats_as_mask(mut self, val: bool) -> Self {
         self.metadata_options.set_encoding_stats_as_mask(val);
         self
