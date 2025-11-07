@@ -70,6 +70,7 @@ impl ParquetMetaDataOptions {
         self.schema_descr = Some(val);
     }
 
+    // with_schema
     add_mutator!(schema, SchemaDescPtr);
 
     /// Returns whether to present the `encoding_stats` field of the `ColumnMetaData` as a
@@ -86,6 +87,7 @@ impl ParquetMetaDataOptions {
         self.encoding_stats_as_mask = val;
     }
 
+    // with_encoding_stats_as_mask
     add_mutator!(encoding_stats_as_mask, bool);
 
     /// Returns whether to skip decoding the `encoding_stats` in the `ColumnMetaData`
@@ -103,6 +105,7 @@ impl ParquetMetaDataOptions {
         self.skip_encoding_stats = if val { Some(None) } else { None };
     }
 
+    // with_skip_encoding_stats
     add_mutator!(skip_encoding_stats, bool);
 
     /// Skip decoding of `encoding_stats`, but decode the stats for those column in
@@ -117,6 +120,7 @@ impl ParquetMetaDataOptions {
         }
     }
 
+    // with_keep_encoding_stats
     add_mutator!(keep_encoding_stats, &[usize]);
 }
 
