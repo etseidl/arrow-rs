@@ -108,6 +108,11 @@ impl ParquetMetaDataOptions {
             .is_some_and(|oset| oset.as_ref().is_none_or(|keep| !keep.contains(&col_index)))
     }
 
+    /// Returns whether `encoding_stats` is skipped for any column.
+    pub fn skip_any_encoding_stats(&self) -> bool {
+        self.skip_encoding_stats.is_some()
+    }
+
     /// Skip decoding of all `encoding_stats`. Takes precedence over
     /// [`Self::encoding_stats_as_mask`].
     pub fn set_skip_encoding_stats(&mut self, val: bool) {

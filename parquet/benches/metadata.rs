@@ -197,7 +197,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let schema = ParquetMetaDataReader::decode_schema(&buf).unwrap();
-    let options = ParquetMetaDataOptions::new().with_schema(schema);
+    let options = ParquetMetaDataOptions::new().with_schema(schema.clone());
     c.bench_function("decode metadata (wide) with schema", |b| {
         b.iter(|| {
             ParquetMetaDataReader::decode_metadata_with_options(&buf, Some(&options)).unwrap();
@@ -213,6 +213,15 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     let options = ParquetMetaDataOptions::new().with_skip_encoding_stats(true);
     c.bench_function("decode metadata (wide) with skip PES", |b| {
+        b.iter(|| {
+            ParquetMetaDataReader::decode_metadata_with_options(&buf, Some(&options)).unwrap();
+        })
+    });
+
+    let options = ParquetMetaDataOptions::new()
+        .with_skip_encoding_stats(true)
+        .with_schema(schema);
+    c.bench_function("decode metadata (wide) with skip PES and schema", |b| {
         b.iter(|| {
             ParquetMetaDataReader::decode_metadata_with_options(&buf, Some(&options)).unwrap();
         })
