@@ -353,7 +353,6 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                     self.read_full_field_id()?
                 };
 
-                
                 // special handling for bools
                 if field_type == FieldType::BooleanFalse as u8 {
                     Ok(FieldIdentifier {
