@@ -331,24 +331,17 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         // we can read at least one byte, which is:
         // - the type
         // - the field delta and the type
-        let field_type = self.read_byte()?;
-        let field_delta = (field_type & 0xf0) >> 4;
-        let field_type = FieldType::try_from(field_type & 0xf)?;
-        let mut bool_val: Option<bool> = None;
+        let field_delta = self.read_byte()?;
+        let field_type = field_delta & 0xf;
+        let field_delta = field_delta >> 4;
 
         match field_type {
-            FieldType::Stop => Ok(FieldIdentifier {
+            0 => Ok(FieldIdentifier {
                 field_type: FieldType::Stop,
                 id: 0,
-                bool_val,
+                bool_val: None,
             }),
             _ => {
-                // special handling for bools
-                if field_type == FieldType::BooleanFalse {
-                    bool_val = Some(false);
-                } else if field_type == FieldType::BooleanTrue {
-                    bool_val = Some(true);
-                }
                 let field_id = if field_delta != 0 {
                     last_field_id.checked_add(field_delta as i16).ok_or(
                         ThriftProtocolError::FieldDeltaOverflow {
@@ -360,11 +353,27 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                     self.read_full_field_id()?
                 };
 
-                Ok(FieldIdentifier {
-                    field_type,
-                    id: field_id,
-                    bool_val,
-                })
+                
+                // special handling for bools
+                if field_type == FieldType::BooleanFalse as u8 {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::BooleanFalse,
+                        id: field_id,
+                        bool_val: Some(false),
+                    })
+                } else if field_type == FieldType::BooleanTrue as u8 {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::BooleanTrue,
+                        id: field_id,
+                        bool_val: Some(true),
+                    })
+                } else {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::try_from(field_type & 0xf)?,
+                        id: field_id,
+                        bool_val: None,
+                    })
+                }
             }
         }
     }
