@@ -249,11 +249,14 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let buf: Bytes = black_box(encoded_meta(true, false)).into();
-    c.bench_function("decode parquet metadata w/ size stats lite (wide)", |b| {
-        b.iter(|| {
-            ParquetMetaDataReader::decode_metadata(&buf).unwrap();
-        })
-    });
+    c.bench_function(
+        "decode parquet metadata w/ size stats no lists (wide)",
+        |b| {
+            b.iter(|| {
+                ParquetMetaDataReader::decode_metadata(&buf).unwrap();
+            })
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);
