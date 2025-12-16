@@ -49,6 +49,7 @@ pub(crate) enum ThriftProtocolError {
     Utf8Error,
     SkipDepth(FieldType),
     SkipUnsupportedType(FieldType),
+    InvalidSkipState,
 }
 
 impl From<ThriftProtocolError> for ParquetError {
@@ -76,6 +77,9 @@ impl From<ThriftProtocolError> for ParquetError {
             }
             ThriftProtocolError::SkipUnsupportedType(field_type) => {
                 general_err!("cannot skip field type {:?}", field_type)
+            }
+            ThriftProtocolError::InvalidSkipState => {
+                general_err!("Encountered invalid state when skipping struct")
             }
         }
     }
@@ -253,6 +257,56 @@ pub(crate) struct ListIdentifier {
     pub(crate) size: i32,
 }
 
+/// Enum used in the skipping of Thrift struct fields.
+#[derive(Copy, Clone, PartialEq)]
+pub(crate) enum SkipState {
+    Empty,  // for empty slots in stack
+    Struct, // currently processing a struct
+    // (count, field_type)
+    List(i32, u8),
+}
+
+impl Default for SkipState {
+    fn default() -> Self {
+        SkipState::Empty
+    }
+}
+
+struct SkipStack<const MAX_DEPTH: usize> {
+    stack: [SkipState; MAX_DEPTH],
+    pos: usize,
+}
+
+impl<const MAX_DEPTH: usize> SkipStack<MAX_DEPTH> {
+    fn new() -> Self {
+        SkipStack {
+            stack: [SkipState::Empty; MAX_DEPTH],
+            pos: 0,
+        }
+    }
+
+    fn push(&mut self, state: SkipState) {
+        assert!(self.pos < MAX_DEPTH, "stack size {MAX_DEPTH} exceeded");
+        self.stack[self.pos] = state;
+        self.pos += 1;
+    }
+
+    fn pop(&mut self) -> SkipState {
+        assert!(self.pos > 0, "trying to pop empty stack");
+        self.pos -= 1;
+        std::mem::take(&mut self.stack[self.pos])
+    }
+
+    fn last_mut(&mut self) -> &mut SkipState {
+        assert!(self.pos > 0, "trying to peek empty stack");
+        &mut self.stack[self.pos - 1]
+    }
+
+    fn is_empty(&mut self) -> bool {
+        self.pos == 0
+    }
+}
+
 /// Low-level object used to deserialize structs encoded with the Thrift [compact] protocol.
 ///
 /// Implementation of this trait must provide the low-level functions `read_byte`, `read_bytes`,
@@ -339,24 +393,17 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         // we can read at least one byte, which is:
         // - the type
         // - the field delta and the type
-        let field_type = self.read_byte()?;
-        let field_delta = (field_type & 0xf0) >> 4;
-        let field_type = FieldType::try_from(field_type & 0xf)?;
-        let mut bool_val: Option<bool> = None;
+        let field_delta = self.read_byte()?;
+        let field_type = field_delta & 0xf;
+        let field_delta = field_delta >> 4;
 
         match field_type {
-            FieldType::Stop => Ok(FieldIdentifier {
+            0 => Ok(FieldIdentifier {
                 field_type: FieldType::Stop,
                 id: 0,
-                bool_val,
+                bool_val: None,
             }),
             _ => {
-                // special handling for bools
-                if field_type == FieldType::BooleanFalse {
-                    bool_val = Some(false);
-                } else if field_type == FieldType::BooleanTrue {
-                    bool_val = Some(true);
-                }
                 let field_id = if field_delta != 0 {
                     last_field_id.checked_add(field_delta as i16).ok_or(
                         ThriftProtocolError::FieldDeltaOverflow {
@@ -368,11 +415,26 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                     self.read_full_field_id()?
                 };
 
-                Ok(FieldIdentifier {
-                    field_type,
-                    id: field_id,
-                    bool_val,
-                })
+                // special handling for bools
+                if field_type == FieldType::BooleanFalse as u8 {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::BooleanFalse,
+                        id: field_id,
+                        bool_val: Some(false),
+                    })
+                } else if field_type == FieldType::BooleanTrue as u8 {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::BooleanTrue,
+                        id: field_id,
+                        bool_val: Some(true),
+                    })
+                } else {
+                    Ok(FieldIdentifier {
+                        field_type: FieldType::try_from(field_type & 0xf)?,
+                        id: field_id,
+                        bool_val: None,
+                    })
+                }
             }
         }
     }
@@ -439,11 +501,20 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
     /// Skip a ULEB128 encoded varint.
     fn skip_vlq(&mut self) -> ThriftProtocolResult<()> {
         loop {
-            let byte = self.read_byte()?;
-            if byte & 0x80 == 0 {
+            if self.read_byte()? as i8 >= 0 {
                 return Ok(());
             }
         }
+    }
+
+    fn skip_list_vlq(&mut self, n: i32) -> ThriftProtocolResult<()> {
+        let mut seen = 0;
+        while seen < n {
+            if self.read_byte()? as i8 >= 0 {
+                seen += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Skip a thrift [binary].
@@ -454,12 +525,143 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         self.skip_bytes(len)
     }
 
-    /// Skip a field with type `field_type` recursively until the default
+    /// Retrieve the [`FieldType`] for a struct field.
+    ///
+    /// This is for skipping structs. We don't need the field id's, just the field type.
+    fn skip_field_header(&mut self) -> ThriftProtocolResult<u8> {
+        let field_type = self.read_byte()?;
+        // test for stop field
+        if field_type == 0 {
+            return Ok(0);
+        }
+        // test for delta > 15
+        else if field_type & 0xf0 == 0 {
+            self.read_full_field_id()?;
+        }
+        Ok(field_type & 0xf)
+    }
+
+    /// Skip a field with type `field_type`.
+    fn skip(&mut self, field_type: FieldType) -> ThriftProtocolResult<()> {
+        // the max depth must be chosen carefully so this won't panic.
+        // TODO(ets): make sure the following is true
+        // right now the maximum depth in the parquet footer is 8.
+        //      1:s      2:l    3:s  4:l    5:s           6:s   7:l      8:s
+        // file_metadata/[row_group]/[column_chunk]/column_meta/[encoding_stats]
+        let mut skip_stack = SkipStack::<8>::new();
+
+        match field_type as u8 {
+            // non-nested fields will return quickly
+            // end of struct and boolean field has no data
+            0..=2 => return Ok(()),
+            // I8
+            3 => return self.skip_bytes(1),
+            // I16, I32, I64
+            4..=6 => return self.skip_vlq(),
+            // DOUBLE
+            7 => return self.skip_bytes(8),
+            // BINARY
+            8 => return self.skip_binary(),
+
+            // list and struct will set up the state stack and continue
+
+            // LIST
+            9 => {
+                let list_ident = self.read_list_begin()?;
+                // if primitive, then skip here, otherwise push onto stack and continue
+                match list_ident.element_type {
+                    ElementType::Bool | ElementType::Byte => {
+                        return self.skip_bytes(list_ident.size as usize);
+                    }
+                    ElementType::I16 | ElementType::I32 | ElementType::I64 => {
+                        return self.skip_list_vlq(list_ident.size);
+                    }
+                    ElementType::Double => return self.skip_bytes(list_ident.size as usize * 8),
+                    _ => {}
+                }
+                skip_stack.push(SkipState::List(
+                    list_ident.size,
+                    list_ident.element_type as u8,
+                ));
+            }
+            // STRUCT
+            12 => skip_stack.push(SkipState::Struct),
+            _ => {
+                return Err(ThriftProtocolError::SkipUnsupportedType(field_type));
+            }
+        }
+
+        loop {
+            let field_type = match skip_stack.last_mut() {
+                SkipState::Struct => self.skip_field_header()?,
+                SkipState::List(count, _) if *count == 0 => {
+                    // we've exhausted the list, so pop it and get the next field header
+                    skip_stack.pop();
+                    // check if we started with a list
+                    if skip_stack.is_empty() {
+                        return Ok(());
+                    }
+                    self.skip_field_header()?
+                }
+                SkipState::List(count, field_type) => {
+                    // still processing list
+                    *count -= 1;
+                    *field_type
+                }
+                _ => return Err(ThriftProtocolError::InvalidSkipState),
+            };
+
+            match field_type {
+                // end of a struct
+                0 => {
+                    // pop stack
+                    if skip_stack.pop() != SkipState::Struct {
+                        return Err(ThriftProtocolError::InvalidSkipState);
+                    }
+
+                    // we're at top level, so done
+                    if skip_stack.is_empty() {
+                        return Ok(());
+                    }
+                }
+                // boolean field has no data
+                1 | 2 => {}
+                // I8
+                3 => self.skip_bytes(1)?,
+                // I16, I32, I64
+                4..=6 => self.skip_vlq()?,
+                // DOUBLE
+                7 => self.skip_bytes(8)?,
+                // BINARY
+                8 => self.skip_binary()?,
+                // STRUCT
+                12 => {
+                    skip_stack.push(SkipState::Struct);
+                }
+                // LIST
+                9 => {
+                    let list_ident = self.read_list_begin()?;
+                    skip_stack.push(SkipState::List(
+                        list_ident.size,
+                        list_ident.element_type as u8,
+                    ));
+                }
+                // no list or map types in parquet format
+                _ => {
+                    return Err(ThriftProtocolError::SkipUnsupportedType(
+                        FieldType::try_from(field_type)?,
+                    ));
+                }
+            }
+        }
+    }
+
+    /* /// Skip a field with type `field_type` recursively until the default
     /// maximum skip depth (currently 64) is reached.
     fn skip(&mut self, field_type: FieldType) -> ThriftProtocolResult<()> {
         const DEFAULT_SKIP_DEPTH: i8 = 64;
         self.skip_till_depth(field_type, DEFAULT_SKIP_DEPTH)
-    }
+    }*/
 
     /// Empty structs in unions consist of a single byte of 0 for the field stop record.
     /// This skips that byte without encuring the cost of processing the [`FieldIdentifier`].
@@ -473,7 +675,7 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         }
     }
 
-    /// Skip a field with type `field_type` recursively up to `depth` levels.
+    /* /// Skip a field with type `field_type` recursively up to `depth` levels.
     fn skip_till_depth(&mut self, field_type: FieldType, depth: i8) -> ThriftProtocolResult<()> {
         if depth == 0 {
             return Err(ThriftProtocolError::SkipDepth(field_type));
@@ -511,7 +713,7 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
             // no list or map types in parquet format
             _ => Err(ThriftProtocolError::SkipUnsupportedType(field_type)),
         }
-    }
+    }*/
 }
 
 /// A high performance Thrift reader that reads from a slice of bytes.
