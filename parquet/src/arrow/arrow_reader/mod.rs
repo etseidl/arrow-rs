@@ -748,7 +748,7 @@ impl ArrowReaderOptions {
     /// This method sets the same policy for both. For fine-grained control, use
     /// [`Self::with_column_index_policy`] and [`Self::with_offset_index_policy`].
     pub fn with_page_index_policy(self, policy: PageIndexPolicy) -> Self {
-        self.with_column_index_policy(policy)
+        self.with_column_index_policy(policy.clone())
             .with_offset_index_policy(policy)
     }
 
@@ -913,7 +913,7 @@ impl ArrowReaderOptions {
     /// This can be set via [`with_offset_index_policy`][Self::with_offset_index_policy]
     /// or [`with_page_index_policy`][Self::with_page_index_policy].
     pub fn offset_index_policy(&self) -> PageIndexPolicy {
-        self.offset_index
+        self.offset_index.clone()
     }
 
     /// Retrieve the currently set [`PageIndexPolicy`] for the column index.
@@ -921,7 +921,7 @@ impl ArrowReaderOptions {
     /// This can be set via [`with_column_index_policy`][Self::with_column_index_policy]
     /// or [`with_page_index_policy`][Self::with_page_index_policy].
     pub fn column_index_policy(&self) -> PageIndexPolicy {
-        self.column_index
+        self.column_index.clone()
     }
 
     /// Retrieve the currently set metadata decoding options.

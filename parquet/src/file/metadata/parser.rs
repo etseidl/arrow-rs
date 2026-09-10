@@ -301,8 +301,14 @@ fn parse_column_index(
         return Ok(());
     }
     for rg_idx in 0..metadata.num_row_groups() {
+        if !column_index_policy.is_keep_row_group(rg_idx) {
+            continue;
+        }
         let rg = metadata.row_group(rg_idx);
         for col_idx in 0..rg.num_columns() {
+            if !column_index_policy.is_keep_column(col_idx) {
+                continue;
+            }
             let col = rg.column(col_idx);
             if let Some(r) = col.column_index_range() {
                 let r_start = usize::try_from(r.start - start_offset)?;
@@ -333,8 +339,14 @@ fn parse_offset_index(
         return Ok(());
     }
     for rg_idx in 0..metadata.num_row_groups() {
+        if !offset_index_policy.is_keep_row_group(rg_idx) {
+            continue;
+        }
         let rg = metadata.row_group(rg_idx);
         for col_idx in 0..rg.num_columns() {
+            if !offset_index_policy.is_keep_column(col_idx) {
+                continue;
+            }
             let col = rg.column(col_idx);
             if let Some(r) = col.offset_index_range() {
                 let r_start = usize::try_from(r.start - start_offset)?;
