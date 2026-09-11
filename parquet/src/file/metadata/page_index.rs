@@ -22,6 +22,7 @@ use crate::file::page_index::{
     column_index::ColumnIndexMetaData,
     offset_index::{OffsetIndexMetaData, PageLocation},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Trait for accessing Parquet [Page Index] data for efficient page-level skipping
@@ -363,6 +364,73 @@ impl RowGroupPageIndex {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PageIndexStorage<T> {
+    Dense(Vec<Vec<Option<T>>>),
+    Sparse(HashMap<usize, HashMap<usize, T>>),
+}
+
+impl<T> PageIndexStorage<T> {
+    pub(crate) fn new_dense(num_row_groups: usize, num_columns: usize) -> Self {
+        let rep = (0..num_row_groups)
+            .map(|_| {
+                let mut idx = Vec::with_capacity(num_columns);
+                idx.resize_with(num_columns, || None);
+                idx
+            })
+            .collect();
+        Self::Dense(rep)
+    }
+
+    pub(crate) fn new_sparse() -> Self {
+        Self::Sparse(HashMap::new())
+    }
+
+    fn get_index(&self, row_group_idx: usize, column_idx: usize) -> Option<&T> {
+        match self {
+            Self::Sparse(idx) => idx.get(&row_group_idx)?.get(&column_idx),
+            Self::Dense(idx) => idx.get(row_group_idx)?.get(column_idx)?.as_ref(),
+        }
+    }
+
+    fn put_index(&mut self, index: T, row_group_idx: usize, column_idx: usize) {
+        match self {
+            Self::Sparse(idx) => {
+                let rg = idx.entry(row_group_idx).or_default();
+                rg.insert(column_idx, index);
+            }
+            Self::Dense(idx) => {
+                if let Some(row_group) = idx.get_mut(row_group_idx)
+                    && let Some(column_slot) = row_group.get_mut(column_idx)
+                {
+                    *column_slot = Some(index);
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Dense(index) => {
+                index.iter()
+                .all(|columns| columns.iter().all(|entry| entry.is_none()))
+            }
+            Self::Sparse(index) => {
+                index.is_empty() || index.values().all(|c| c.is_empty())
+            }
+        }
+    }
+}
+
+impl<T: HeapSize> HeapSize for PageIndexStorage<T> {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Sparse(idx) => idx.heap_size(),
+            Self::Dense(idx) => idx.heap_size(),
+        }
+    }
+}
+
 /// Struct to encapsulate the Parquet [Page Index]
 ///
 /// This struct provides a dense representation of the Page Index. It is
@@ -441,14 +509,14 @@ impl RowGroupPageIndex {
 /// [`ParquetMetaData`]: crate::file::metadata::ParquetMetaData
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageIndex {
-    column_indexes: Option<Vec<Vec<Option<ColumnIndexMetaData>>>>,
-    offset_indexes: Option<Vec<Vec<Option<OffsetIndexMetaData>>>>,
+    column_indexes: Option<PageIndexStorage<ColumnIndexMetaData>>,
+    offset_indexes: Option<PageIndexStorage<OffsetIndexMetaData>>,
 }
 
 impl PageIndex {
     pub(crate) fn new(
-        column_indexes: Option<Vec<Vec<Option<ColumnIndexMetaData>>>>,
-        offset_indexes: Option<Vec<Vec<Option<OffsetIndexMetaData>>>>,
+        column_indexes: Option<PageIndexStorage<ColumnIndexMetaData>>,
+        offset_indexes: Option<PageIndexStorage<OffsetIndexMetaData>>,
     ) -> Self {
         Self {
             column_indexes,
@@ -476,8 +544,7 @@ impl PageIndexProvider for PageIndex {
         row_group_idx: usize,
         column_idx: usize,
     ) -> Option<&ColumnIndexMetaData> {
-        let rg = self.column_indexes.as_ref()?.get(row_group_idx)?;
-        rg.get(column_idx)?.as_ref()
+        self.column_indexes.as_ref()?.get_index(row_group_idx, column_idx)
     }
 
     fn offset_index(
@@ -485,8 +552,7 @@ impl PageIndexProvider for PageIndex {
         row_group_idx: usize,
         column_idx: usize,
     ) -> Option<&OffsetIndexMetaData> {
-        let rg = self.offset_indexes.as_ref()?.get(row_group_idx)?;
-        rg.get(column_idx)?.as_ref()
+        self.offset_indexes.as_ref()?.get_index(row_group_idx, column_idx)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -508,33 +574,11 @@ impl HeapSize for PageIndex {
 /// - Automatic conversion of empty structures to `None` to save memory
 #[derive(Default)]
 pub struct PageIndexBuilder {
-    column_indexes: Option<Vec<Vec<Option<ColumnIndexMetaData>>>>,
-    offset_indexes: Option<Vec<Vec<Option<OffsetIndexMetaData>>>>,
+    column_indexes: Option<PageIndexStorage<ColumnIndexMetaData>>,
+    offset_indexes: Option<PageIndexStorage<OffsetIndexMetaData>>,
 }
 
 impl PageIndexBuilder {
-    /// Creates an empty index structure with space for the specified number of row groups and columns
-    ///
-    /// Returns `Some` containing a nested vector structure where all entries are initialized to `None`.
-    /// The outer vector has one entry per row group, and each inner vector has one entry per column.
-    ///
-    /// # Type Parameters
-    /// * `T` - The type of index this is to be, either `ColumnIndexMetaData` or `OffsetIndexMetaData`
-    pub(crate) fn empty_index<T>(
-        num_row_groups: usize,
-        num_columns: usize,
-    ) -> Option<Vec<Vec<Option<T>>>> {
-        Some(
-            (0..num_row_groups)
-                .map(|_| {
-                    let mut idx = Vec::with_capacity(num_columns);
-                    idx.resize_with(num_columns, || None);
-                    idx
-                })
-                .collect(),
-        )
-    }
-
     /// Creates a new [`PageIndexBuilder`] with space allocated for both column and offset indexes
     ///
     /// This allocates empty index structures for the specified number of row groups and columns.
@@ -542,8 +586,19 @@ impl PageIndexBuilder {
     /// [`put_column_index`](Self::put_column_index) and [`put_offset_index`](Self::put_offset_index).
     pub fn new(num_row_groups: usize, num_columns: usize) -> Self {
         Self {
-            column_indexes: Self::empty_index(num_row_groups, num_columns),
-            offset_indexes: Self::empty_index(num_row_groups, num_columns),
+            column_indexes: Some(PageIndexStorage::new_dense(num_row_groups, num_columns)),
+            offset_indexes: Some(PageIndexStorage::new_dense(num_row_groups, num_columns)),
+        }
+    }
+
+    /// Creates a new [`PageIndexBuilder`] that uses a sparse storage implementation
+    ///
+    /// This will allocate storage as needed when indexes are added via
+    /// [`put_column_index`](Self::put_column_index) and [`put_offset_index`](Self::put_offset_index).
+    pub fn new_sparse() -> Self {
+        Self {
+            column_indexes: Some(PageIndexStorage::new_sparse()),
+            offset_indexes: Some(PageIndexStorage::new_sparse()),
         }
     }
 
@@ -567,7 +622,7 @@ impl PageIndexBuilder {
     /// This can be used to add column index storage to a builder that lacks one
     /// (either a `Default` builder, or one created from a [`PageIndex`] without column indexes).
     pub fn allocate_column_indexes(&mut self, num_row_groups: usize, num_columns: usize) {
-        self.column_indexes = Self::empty_index(num_row_groups, num_columns);
+        self.column_indexes = Some(PageIndexStorage::new_dense(num_row_groups, num_columns));
     }
 
     /// Allocates space for offset indexes
@@ -579,7 +634,23 @@ impl PageIndexBuilder {
     /// This can be used to add offset index storage to a builder that lacks one
     /// (either a `Default` builder, or one created from a [`PageIndex`] without offset indexes).
     pub fn allocate_offset_indexes(&mut self, num_row_groups: usize, num_columns: usize) {
-        self.offset_indexes = Self::empty_index(num_row_groups, num_columns);
+        self.offset_indexes = Some(PageIndexStorage::new_dense(num_row_groups, num_columns));
+    }
+
+    /// Allocate sparse storage for column indexes
+    ///
+    /// This can be used to add sparse column index storage to a builder that lacks one
+    /// (either a `Default` builder, or one created from a [`PageIndex`] without column indexes).
+    pub fn allocate_sparse_column_indexes(&mut self) {
+        self.column_indexes = Some(PageIndexStorage::new_sparse());
+    }
+
+    /// Allocate sparse storage for offset indexes
+    /// 
+    /// This can be used to add sparse offset index storage to a builder that lacks one
+    /// (either a `Default` builder, or one created from a [`PageIndex`] without offset indexes).
+    pub fn allocate_sparse_offset_indexes(&mut self) {
+        self.offset_indexes = Some(PageIndexStorage::new_sparse());
     }
 
     /// Sets the column index for a specific row group and column
@@ -592,11 +663,8 @@ impl PageIndexBuilder {
         row_group_idx: usize,
         column_idx: usize,
     ) {
-        if let Some(ref mut indexes) = self.column_indexes
-            && let Some(row_group) = indexes.get_mut(row_group_idx)
-            && let Some(column_slot) = row_group.get_mut(column_idx)
-        {
-            *column_slot = Some(column_index);
+        if let Some(ref mut indexes) = self.column_indexes {
+            indexes.put_index(column_index, row_group_idx, column_idx);
         }
     }
 
@@ -610,21 +678,16 @@ impl PageIndexBuilder {
         row_group_idx: usize,
         column_idx: usize,
     ) {
-        if let Some(ref mut indexes) = self.offset_indexes
-            && let Some(row_group) = indexes.get_mut(row_group_idx)
-            && let Some(column_slot) = row_group.get_mut(column_idx)
-        {
-            *column_slot = Some(offset_index);
+        if let Some(ref mut indexes) = self.offset_indexes {
+            indexes.put_index(offset_index, row_group_idx, column_idx);
         }
     }
 
     /// Checks if an index structure is entirely empty (all entries are None)
-    fn is_empty_index<T>(index: Option<&Vec<Vec<Option<T>>>>) -> bool {
+    fn is_empty_index<T>(index: Option<&PageIndexStorage<T>>) -> bool {
         match index {
             None => true,
-            Some(row_groups) => row_groups
-                .iter()
-                .all(|columns| columns.iter().all(|entry| entry.is_none())),
+            Some(index) => index.is_empty(),
         }
     }
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::file::metadata::page_index::{PageIndexBuilder, PageIndexProvider};
+use crate::file::metadata::page_index::{PageIndexProvider, PageIndexStorage};
 use crate::file::metadata::thrift::FileMeta;
 use crate::file::metadata::{ColumnChunkMetaData, PageIndex, RowGroupMetaData};
 use crate::schema::types::{SchemaDescPtr, SchemaDescriptor};
@@ -32,7 +32,10 @@ use crate::{
     file::column_crypto_metadata::ColumnCryptoMetaData,
     file::metadata::thrift::encryption::{AesGcmV1, EncryptionAlgorithm, FileCryptoMetaData},
 };
-use crate::{errors::Result, file::page_index::column_index::ColumnIndexMetaData};
+use crate::{
+    errors::{ParquetError, Result},
+    file::page_index::column_index::ColumnIndexMetaData,
+};
 
 use crate::{
     file::writer::{TrackedWrite, get_file_magic},
@@ -72,10 +75,12 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn write_offset_indexes(
         &mut self,
         page_index: &Arc<dyn PageIndexProvider>,
-    ) -> Result<Option<Vec<Vec<Option<OffsetIndexMetaData>>>>> {
+    ) -> Result<PageIndexStorage<OffsetIndexMetaData>> {
         let mut offset_indexes =
-            PageIndexBuilder::empty_index(self.row_groups.len(), self.schema_descr.num_columns());
-        let offidx_vec = offset_indexes.as_mut().unwrap();
+            PageIndexStorage::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
+        let PageIndexStorage::Dense(offidx_vec) = &mut offset_indexes else {
+            return Err(general_err!("offset index is the wrong form"));
+        };
 
         // we've already checked before calling that the offset indexes are populated
         assert!(page_index.has_offset_indexes());
@@ -113,10 +118,12 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn write_column_indexes(
         &mut self,
         page_index: &Arc<dyn PageIndexProvider>,
-    ) -> Result<Option<Vec<Vec<Option<ColumnIndexMetaData>>>>> {
+    ) -> Result<PageIndexStorage<ColumnIndexMetaData>> {
         let mut column_indexes =
-            PageIndexBuilder::empty_index(self.row_groups.len(), self.schema_descr.num_columns());
-        let colidx_vec = column_indexes.as_mut().unwrap();
+            PageIndexStorage::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
+        let PageIndexStorage::Dense(colidx_vec) = &mut column_indexes else {
+            return Err(general_err!("column index is the wrong form"));
+        };
 
         // we've already checked before calling that the column indexes are populated
         assert!(page_index.has_column_indexes());
@@ -153,7 +160,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn finalize_column_indexes(
         &mut self,
         page_index: Option<&Arc<dyn PageIndexProvider>>,
-    ) -> Result<Option<Vec<Vec<Option<ColumnIndexMetaData>>>>> {
+    ) -> Result<Option<PageIndexStorage<ColumnIndexMetaData>>> {
         if page_index
             .as_ref()
             .is_none_or(|pi| !pi.has_column_indexes())
@@ -165,14 +172,17 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
         let column_indexes = self.write_column_indexes(page_index.as_ref().unwrap())?;
 
         // check to see if the index is `None` for every row group and column chunk
-        let all_none = column_indexes
-            .as_ref()
-            .is_some_and(|ci| ci.iter().all(|cii| cii.iter().all(|idx| idx.is_none())));
+        let all_none = match &column_indexes {
+            PageIndexStorage::Dense(index) => {
+                index.iter().all(|cii| cii.iter().all(|idx| idx.is_none()))
+            }
+            _ => return Err(general_err!("wrong form for column index")),
+        };
 
         if all_none {
             Ok(None)
         } else {
-            Ok(column_indexes)
+            Ok(Some(column_indexes))
         }
     }
 
@@ -180,7 +190,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn finalize_offset_indexes(
         &mut self,
         page_index: Option<&Arc<dyn PageIndexProvider>>,
-    ) -> Result<Option<Vec<Vec<Option<OffsetIndexMetaData>>>>> {
+    ) -> Result<Option<PageIndexStorage<OffsetIndexMetaData>>> {
         if page_index
             .as_ref()
             .is_none_or(|pi| !pi.has_offset_indexes())
@@ -192,14 +202,17 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
         let offset_indexes = self.write_offset_indexes(page_index.as_ref().unwrap())?;
 
         // check to see if the index is `None` for every row group and column chunk
-        let all_none = offset_indexes
-            .as_ref()
-            .is_some_and(|oi| oi.iter().all(|oii| oii.iter().all(|idx| idx.is_none())));
+        let all_none = match &offset_indexes {
+            PageIndexStorage::Dense(index) => {
+                index.iter().all(|oii| oii.iter().all(|idx| idx.is_none()))
+            }
+            _ => return Err(general_err!("wrong form for offset index")),
+        };
 
         if all_none {
             Ok(None)
         } else {
-            Ok(offset_indexes)
+            Ok(Some(offset_indexes))
         }
     }
 
