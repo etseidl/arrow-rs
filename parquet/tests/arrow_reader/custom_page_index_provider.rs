@@ -400,6 +400,41 @@ fn test_parse_selected_columns() {
     }
 }
 
+
+#[test]
+fn test_parse_selected_columns_mixed() {
+    // test populating PageIndex with a subset of columns
+    let temp_file = create_test_file();
+    let file = File::open(temp_file.path()).unwrap();
+
+    // populate column 0 for column index and all columns for offset index
+    let mut reader = ParquetMetaDataReader::new()
+        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
+        .with_offset_index_policy(PageIndexPolicy::Required);
+
+    // parse metadata
+    reader.try_parse(&file).unwrap();
+    let metadata = reader.finish().unwrap();
+    let num_rg = metadata.num_row_groups();
+
+    // test page indexes
+    for rg in 0..num_rg {
+        let idx = metadata.page_index_for_row_group(rg);
+        // column 0 has both indexes
+        assert!(idx.column_index(0).is_some());
+        assert!(idx.offset_index(0).is_some());
+        // column 1 has no indexes
+        assert!(idx.column_index(1).is_none());
+        assert!(idx.offset_index(1).is_some());
+        // column 2 has offset index
+        assert!(idx.column_index(2).is_none());
+        assert!(idx.offset_index(2).is_some());
+        // column 3 has no indexes
+        assert!(idx.column_index(3).is_none());
+        assert!(idx.offset_index(3).is_some());
+    }
+}
+
 #[test]
 fn test_parse_selected_row_groups() {
     // test populating PageIndex with a subset of row groups
@@ -475,6 +510,16 @@ fn test_page_index_sizes() {
     let temp_file = create_test_file();
     let file = File::open(temp_file.path()).unwrap();
 
+    // no index
+    let mut reader = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Skip);
+
+    // parse metadata
+    reader.try_parse(&file).unwrap();
+    let metadata = reader.finish().unwrap();
+    assert!(metadata.page_index().is_none());
+    assert_eq!(metadata.memory_size(), 7817);
+
     // full index
     let mut reader = ParquetMetaDataReader::new()
         .with_page_index_policy(PageIndexPolicy::Required);
@@ -483,7 +528,18 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    println!("full {}", metadata.memory_size());
+    assert_eq!(metadata.memory_size(), 14385);
+
+    // populate column 0 for column index and all columns for offset index
+    let mut reader = ParquetMetaDataReader::new()
+        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
+        .with_offset_index_policy(PageIndexPolicy::Required);
+
+    // parse metadata
+    reader.try_parse(&file).unwrap();
+    let metadata = reader.finish().unwrap();
+    assert!(metadata.page_index().is_some());
+    assert_eq!(metadata.memory_size(), 13592);
 
     // populate column 0 for column index and columns 0 & 2 for the offset index
     let mut reader = ParquetMetaDataReader::new()
@@ -494,7 +550,7 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    println!("cols {}", metadata.memory_size());
+    assert_eq!(metadata.memory_size(), 13200);
 
     // populate only row group 1, column index gets column 0, offset index gets
     // columns 0 and 2.
@@ -506,5 +562,5 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    println!("rg_cols {}", metadata.memory_size());
+    assert_eq!(metadata.memory_size(), 10022);
 }
