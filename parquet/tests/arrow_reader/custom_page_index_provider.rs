@@ -400,7 +400,6 @@ fn test_parse_selected_columns() {
     }
 }
 
-
 #[test]
 fn test_parse_selected_columns_mixed() {
     // test populating PageIndex with a subset of columns
@@ -511,8 +510,7 @@ fn test_page_index_sizes() {
     let file = File::open(temp_file.path()).unwrap();
 
     // no index
-    let mut reader = ParquetMetaDataReader::new()
-        .with_page_index_policy(PageIndexPolicy::Skip);
+    let mut reader = ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Skip);
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -521,8 +519,7 @@ fn test_page_index_sizes() {
     assert_eq!(metadata.memory_size(), 7817);
 
     // full index
-    let mut reader = ParquetMetaDataReader::new()
-        .with_page_index_policy(PageIndexPolicy::Required);
+    let mut reader = ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
 
     // parse metadata
     reader.try_parse(&file).unwrap();

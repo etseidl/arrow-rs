@@ -411,13 +411,10 @@ impl<T> PageIndexStorage<T> {
 
     fn is_empty(&self) -> bool {
         match self {
-            Self::Dense(index) => {
-                index.iter()
-                .all(|columns| columns.iter().all(|entry| entry.is_none()))
-            }
-            Self::Sparse(index) => {
-                index.is_empty() || index.values().all(|c| c.is_empty())
-            }
+            Self::Dense(index) => index
+                .iter()
+                .all(|columns| columns.iter().all(|entry| entry.is_none())),
+            Self::Sparse(index) => index.is_empty() || index.values().all(|c| c.is_empty()),
         }
     }
 }
@@ -544,7 +541,9 @@ impl PageIndexProvider for PageIndex {
         row_group_idx: usize,
         column_idx: usize,
     ) -> Option<&ColumnIndexMetaData> {
-        self.column_indexes.as_ref()?.get_index(row_group_idx, column_idx)
+        self.column_indexes
+            .as_ref()?
+            .get_index(row_group_idx, column_idx)
     }
 
     fn offset_index(
@@ -552,7 +551,9 @@ impl PageIndexProvider for PageIndex {
         row_group_idx: usize,
         column_idx: usize,
     ) -> Option<&OffsetIndexMetaData> {
-        self.offset_indexes.as_ref()?.get_index(row_group_idx, column_idx)
+        self.offset_indexes
+            .as_ref()?
+            .get_index(row_group_idx, column_idx)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -646,7 +647,7 @@ impl PageIndexBuilder {
     }
 
     /// Allocate sparse storage for offset indexes
-    /// 
+    ///
     /// This can be used to add sparse offset index storage to a builder that lacks one
     /// (either a `Default` builder, or one created from a [`PageIndex`] without offset indexes).
     pub fn allocate_sparse_offset_indexes(&mut self) {
@@ -718,5 +719,66 @@ impl PageIndexBuilder {
 impl From<PageIndex> for PageIndexBuilder {
     fn from(page_index: PageIndex) -> Self {
         Self::new_from(page_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        basic::BoundaryOrder,
+        file::{
+            metadata::{HeapSize, page_index::PageIndexStorage},
+            page_index::column_index::{ColumnIndexMetaData, PrimitiveColumnIndex},
+        },
+    };
+
+    fn run_test(num_rg: usize, num_col: usize, num_pop: usize, ci: &ColumnIndexMetaData) {
+        let mut d = PageIndexStorage::<ColumnIndexMetaData>::new_dense(num_rg, num_col);
+        let mut s = PageIndexStorage::<ColumnIndexMetaData>::new_sparse();
+
+        for rg in 0..num_rg {
+            for c in 0..num_pop {
+                d.put_index(ci.clone(), rg, c);
+                s.put_index(ci.clone(), rg, c);
+            }
+        }
+
+        let dsz = d.heap_size();
+        let ssz = s.heap_size();
+        println!("rg: {num_rg} col: {num_pop}/{num_col} dense {dsz} sparse {ssz}");
+    }
+
+    #[test]
+    fn test_sizes() {
+        let ci = PrimitiveColumnIndex::<i32>::try_new(
+            vec![false; 3],
+            BoundaryOrder::ASCENDING,
+            Some(vec![0; 3]),
+            Some(vec![0; 3]),
+            None,
+            None,
+            vec![&[0, 0, 0, 0]; 3],
+            vec![&[1, 0, 0, 0]; 3],
+        )
+        .unwrap();
+        let ci = ColumnIndexMetaData::INT32(ci);
+
+        run_test(10, 10, 1, &ci);
+        run_test(10, 10, 5, &ci);
+        run_test(10, 10, 10, &ci);
+
+        run_test(10, 100, 1, &ci);
+        run_test(10, 100, 5, &ci);
+        run_test(10, 100, 10, &ci);
+        run_test(10, 100, 50, &ci);
+        run_test(10, 100, 75, &ci);
+        run_test(10, 100, 100, &ci);
+
+        run_test(10, 1000, 10, &ci);
+        run_test(10, 1000, 50, &ci);
+        run_test(10, 1000, 100, &ci);
+        run_test(10, 1000, 500, &ci);
+        run_test(10, 1000, 750, &ci);
+        run_test(10, 1000, 1000, &ci);
     }
 }
