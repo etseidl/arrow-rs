@@ -422,7 +422,7 @@ impl Keep {
 
 impl HeapSize for [u32] {
     fn heap_size(&self) -> usize {
-        std::mem::size_of::<u32>() * self.len()
+        std::mem::size_of_val(self)
     }
 }
 
@@ -467,7 +467,7 @@ impl<T: Clone> Grid<T> {
         let col_offset = self.cols.position(col)?;
 
         let index = row_offset * self.cols.len() + col_offset;
-        self.cells.get(index).and_then(|opt| opt.as_ref())
+        self.cells.get(index)?.as_ref()
     }
 
     /// Sets a value at the specified row and column
@@ -905,7 +905,7 @@ mod tests {
     fn run_test(num_rg: usize, num_col: usize, num_pop: usize, ci: &ColumnIndexMetaData) {
         let mut d = PageIndexStorage::<ColumnIndexMetaData>::new_dense(num_rg, num_col);
         let keep_rg = Keep::new_full(num_rg);
-        let keep_col_set = BTreeSet::from_iter((0..num_pop).into_iter());
+        let keep_col_set = BTreeSet::from_iter(0..num_pop);
         let keep_col = Keep::new(&keep_col_set, num_col);
         let mut s = PageIndexStorage::<ColumnIndexMetaData>::new_sparse(keep_rg, keep_col);
 
@@ -948,8 +948,8 @@ mod tests {
     fn test_sparse_get_put() {
         let ci = colidx_for_test();
 
-        let keep_rows = Keep::new(&BTreeSet::from_iter([0, 3, 7].into_iter()), 10);
-        let keep_cols = Keep::new(&BTreeSet::from_iter([5, 10, 99].into_iter()), 100);
+        let keep_rows = Keep::new(&BTreeSet::from_iter([0, 3, 7]), 10);
+        let keep_cols = Keep::new(&BTreeSet::from_iter([5, 10, 99]), 100);
         let mut storage = PageIndexStorage::new_sparse(keep_rows, keep_cols);
 
         // Test insertion and retrieval
@@ -976,8 +976,8 @@ mod tests {
     fn test_sparse_is_empty() {
         let ci = colidx_for_test();
 
-        let keep_rows = Keep::new(&BTreeSet::from_iter([0, 3, 7].into_iter()), 10);
-        let keep_cols = Keep::new(&BTreeSet::from_iter([5, 10, 99].into_iter()), 100);
+        let keep_rows = Keep::new(&BTreeSet::from_iter([0, 3, 7]), 10);
+        let keep_cols = Keep::new(&BTreeSet::from_iter([5, 10, 99]), 100);
         let mut storage = PageIndexStorage::new_sparse(keep_rows, keep_cols);
         assert!(storage.is_empty());
 

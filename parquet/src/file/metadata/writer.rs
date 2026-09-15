@@ -176,7 +176,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
             PageIndexStorage::Dense(index) => {
                 index.iter().all(|cii| cii.iter().all(|idx| idx.is_none()))
             }
-            _ => return Err(general_err!("wrong form for column index")),
+            PageIndexStorage::Sparse(_) => return Err(general_err!("wrong form for column index")),
         };
 
         if all_none {
@@ -206,7 +206,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
             PageIndexStorage::Dense(index) => {
                 index.iter().all(|oii| oii.iter().all(|idx| idx.is_none()))
             }
-            _ => return Err(general_err!("wrong form for offset index")),
+            PageIndexStorage::Sparse(_) => return Err(general_err!("wrong form for offset index")),
         };
 
         if all_none {
