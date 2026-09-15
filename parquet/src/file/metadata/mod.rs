@@ -2119,9 +2119,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3344;
+        let bigger_expected_size = 3376;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3512;
+        let bigger_expected_size = 3544;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);

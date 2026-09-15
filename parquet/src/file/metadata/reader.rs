@@ -27,7 +27,7 @@ use crate::file::metadata::{
 use crate::file::reader::ChunkReader;
 use crate::schema::types::SchemaDescriptor;
 use bytes::Bytes;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::{io::Read, ops::Range};
 
@@ -95,12 +95,12 @@ pub enum PageIndexPolicy {
     /// for the column index.
     Required,
     /// Behaves as [`Self::Required`] for the listed column indexes, [`Self::Skip`] otherwise
-    OnlyColumns(Arc<HashSet<usize>>),
+    OnlyColumns(Arc<BTreeSet<usize>>),
     /// Behaves as [`Self::Required`] for the listed row group indexes, [`Self::Skip`] otherwise
-    OnlyRowGroups(Arc<HashSet<usize>>),
+    OnlyRowGroups(Arc<BTreeSet<usize>>),
     /// Behaves as [`Self::Required`] for the listed row group and column indexes,
     /// [`Self::Skip`] otherwise
-    OnlyRowGroupsColumns(Arc<HashSet<usize>>, Arc<HashSet<usize>>),
+    OnlyRowGroupsColumns(Arc<BTreeSet<usize>>, Arc<BTreeSet<usize>>),
 }
 
 impl PageIndexPolicy {
@@ -108,7 +108,7 @@ impl PageIndexPolicy {
     ///
     /// If `keep` is empty, then this returns [`Self::Skip`]
     pub fn only_columns(keep: impl IntoIterator<Item = usize>) -> Self {
-        let keep_set: HashSet<usize> = keep.into_iter().collect();
+        let keep_set: BTreeSet<usize> = keep.into_iter().collect();
         if keep_set.is_empty() {
             Self::Skip
         } else {
@@ -131,7 +131,7 @@ impl PageIndexPolicy {
     ///
     /// If `keep` is empty, then this returns [`Self::Skip`]
     pub fn only_row_groups(keep: impl IntoIterator<Item = usize>) -> Self {
-        let keep_set: HashSet<usize> = keep.into_iter().collect();
+        let keep_set: BTreeSet<usize> = keep.into_iter().collect();
         if keep_set.is_empty() {
             Self::Skip
         } else {
@@ -160,8 +160,8 @@ impl PageIndexPolicy {
         keep_row_groups: impl IntoIterator<Item = usize>,
         keep_columns: impl IntoIterator<Item = usize>,
     ) -> Self {
-        let rg_set: HashSet<usize> = keep_row_groups.into_iter().collect();
-        let col_set: HashSet<usize> = keep_columns.into_iter().collect();
+        let rg_set: BTreeSet<usize> = keep_row_groups.into_iter().collect();
+        let col_set: BTreeSet<usize> = keep_columns.into_iter().collect();
         let rg_set = Arc::new(rg_set);
         let col_set = Arc::new(col_set);
         match (rg_set.is_empty(), col_set.is_empty()) {

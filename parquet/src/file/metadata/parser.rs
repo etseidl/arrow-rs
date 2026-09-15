@@ -257,16 +257,12 @@ pub(crate) fn parse_page_index(
     {
         return Ok(());
     }
-    let num_row_groups = metadata.num_row_groups();
-    let num_columns = metadata.file_metadata().schema_descr().num_columns();
-    let mut builder = PageIndexBuilder::default();
+    let mut builder = PageIndexBuilder::new_with_policy(
+        metadata,
+        column_index_policy.clone(),
+        offset_index_policy.clone(),
+    );
     if column_index_policy != PageIndexPolicy::Skip {
-        match column_index_policy {
-            PageIndexPolicy::Optional | PageIndexPolicy::Required => {
-                builder.allocate_column_indexes(num_row_groups, num_columns)
-            }
-            _ => builder.allocate_sparse_column_indexes(),
-        }
         parse_column_index(
             metadata,
             column_index_policy,
@@ -276,12 +272,6 @@ pub(crate) fn parse_page_index(
         )?;
     }
     if offset_index_policy != PageIndexPolicy::Skip {
-        match offset_index_policy {
-            PageIndexPolicy::Optional | PageIndexPolicy::Required => {
-                builder.allocate_offset_indexes(num_row_groups, num_columns)
-            }
-            _ => builder.allocate_sparse_offset_indexes(),
-        }
         parse_offset_index(
             metadata,
             offset_index_policy,

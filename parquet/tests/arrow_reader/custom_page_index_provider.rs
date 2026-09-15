@@ -516,6 +516,9 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_none());
+    #[cfg(not(feature = "encryption"))]
+    assert_eq!(metadata.memory_size(), 7393);
+    #[cfg(feature = "encryption")]
     assert_eq!(metadata.memory_size(), 7817);
 
     // full index
@@ -525,7 +528,10 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    assert_eq!(metadata.memory_size(), 14385);
+    #[cfg(not(feature = "encryption"))]
+    assert_eq!(metadata.memory_size(), 13993);
+    #[cfg(feature = "encryption")]
+    assert_eq!(metadata.memory_size(), 14417);
 
     // populate column 0 for column index and all columns for offset index
     let mut reader = ParquetMetaDataReader::new()
@@ -536,7 +542,10 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    assert_eq!(metadata.memory_size(), 13592);
+    #[cfg(not(feature = "encryption"))]
+    assert_eq!(metadata.memory_size(), 10740);
+    #[cfg(feature = "encryption")]
+    assert_eq!(metadata.memory_size(), 11164);
 
     // populate column 0 for column index and columns 0 & 2 for the offset index
     let mut reader = ParquetMetaDataReader::new()
@@ -547,7 +556,10 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    assert_eq!(metadata.memory_size(), 13200);
+    #[cfg(not(feature = "encryption"))]
+    assert_eq!(metadata.memory_size(), 9692);
+    #[cfg(feature = "encryption")]
+    assert_eq!(metadata.memory_size(), 10116);
 
     // populate only row group 1, column index gets column 0, offset index gets
     // columns 0 and 2.
@@ -559,5 +571,8 @@ fn test_page_index_sizes() {
     reader.try_parse(&file).unwrap();
     let metadata = reader.finish().unwrap();
     assert!(metadata.page_index().is_some());
-    assert_eq!(metadata.memory_size(), 10022);
+    #[cfg(not(feature = "encryption"))]
+    assert_eq!(metadata.memory_size(), 8362);
+    #[cfg(feature = "encryption")]
+    assert_eq!(metadata.memory_size(), 8786);
 }
