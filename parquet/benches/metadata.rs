@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use parquet::basic::{Encoding, PageType, Type as PhysicalType};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, FileMetaData, LevelHistogram, PageEncodingStats, ParquetMetaData,
-    ParquetMetaDataOptions, ParquetMetaDataReader, ParquetMetaDataWriter, ParquetStatisticsPolicy,
-    RowGroupMetaData,
+    ColumnChunkMetaData, FileMetaData, LevelHistogram, PageEncodingStats, PageIndexPolicy,
+    ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader, ParquetMetaDataWriter,
+    ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use parquet::file::statistics::Statistics;
 use parquet::file::writer::TrackedWrite;
@@ -188,6 +188,15 @@ fn criterion_benchmark(c: &mut Criterion) {
                 .with_encoding_stats_as_mask(false)
                 .build();
             SerializedFileReader::new_with_options(data.clone(), options).unwrap()
+        })
+    });
+
+    c.bench_function("open(page index reduced columns)", |b| {
+        b.iter(|| {
+            let reader = ParquetMetaDataReader::new()
+                .with_column_index_policy(PageIndexPolicy::only_columns([0]))
+                .with_offset_index_policy(PageIndexPolicy::only_columns([0, 1, 4]));
+            reader.parse_and_finish(&data).unwrap();
         })
     });
 
