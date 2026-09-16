@@ -19,12 +19,14 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use parquet::basic::{Encoding, PageType, Type as PhysicalType};
+use parquet::basic::{BoundaryOrder, Encoding, PageType, Type as PhysicalType};
+use parquet::file::metadata::page_index::{PageIndexBuilder, PageIndexProvider};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, FileMetaData, LevelHistogram, PageEncodingStats, PageIndexPolicy,
-    ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader, ParquetMetaDataWriter,
-    ParquetStatisticsPolicy, RowGroupMetaData,
+    ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, LevelHistogram, PageEncodingStats,
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader,
+    ParquetMetaDataWriter, ParquetStatisticsPolicy, RowGroupMetaData,
 };
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 use parquet::file::writer::TrackedWrite;
 use parquet::schema::parser::parse_message_type;
@@ -323,5 +325,85 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, criterion_benchmark);
+fn run_page_index_bench(
+    c: &mut Criterion,
+    num_rg: usize,
+    num_col: usize,
+    num_pop: usize,
+    ci: &ColumnIndexMetaData,
+) {
+    // create the sparse and dense builders
+    let mut sparse_builder = PageIndexBuilder::new_with_policy(
+        num_rg,
+        num_col,
+        PageIndexPolicy::only_columns(0..num_pop),
+        PageIndexPolicy::Skip,
+    );
+    let mut denss_builder = PageIndexBuilder::new(num_rg, num_col);
+
+    for rg in 0..num_rg {
+        for c in 0..num_pop {
+            denss_builder.put_column_index(ci.clone(), rg, c);
+            sparse_builder.put_column_index(ci.clone(), rg, c);
+        }
+    }
+
+    let d = denss_builder.build();
+    let s = sparse_builder.build();
+
+    c.bench_function(
+        &format!("page_index_dense({num_rg},{num_pop}/{num_col})"),
+        |b| {
+            b.iter(|| {
+                // this should exist
+                black_box(d.column_index(0, 0));
+                // this will not exist except for num_pop == num_col
+                black_box(d.column_index(num_rg - 1, num_col - 1));
+            })
+        },
+    );
+
+    c.bench_function(
+        &format!("page_index_sparse({num_rg},{num_pop}/{num_col})"),
+        |b| {
+            b.iter(|| {
+                black_box(s.column_index(0, 0));
+                black_box(s.column_index(num_rg - 1, num_col - 1));
+            })
+        },
+    );
+}
+
+fn page_index(c: &mut Criterion) {
+    let mut column_index = ColumnIndexBuilder::new(parquet::basic::Type::INT32);
+    column_index.set_boundary_order(BoundaryOrder::ASCENDING);
+    column_index.append(false, vec![1u8, 0, 0, 0], vec![2u8, 0, 0, 0], 0, None);
+    column_index.append(false, vec![1u8, 0, 0, 0], vec![2u8, 0, 0, 0], 0, None);
+    column_index.append(false, vec![1u8, 0, 0, 0], vec![2u8, 0, 0, 0], 0, None);
+    let column_index = column_index.build().unwrap();
+
+    run_page_index_bench(c, 10, 100, 1, &column_index);
+    run_page_index_bench(c, 10, 100, 5, &column_index);
+    run_page_index_bench(c, 10, 100, 10, &column_index);
+    run_page_index_bench(c, 10, 100, 50, &column_index);
+    run_page_index_bench(c, 10, 100, 75, &column_index);
+    run_page_index_bench(c, 10, 100, 100, &column_index);
+    run_page_index_bench(c, 10, 1000, 10, &column_index);
+    run_page_index_bench(c, 10, 1000, 50, &column_index);
+    run_page_index_bench(c, 10, 1000, 100, &column_index);
+    run_page_index_bench(c, 10, 1000, 500, &column_index);
+    run_page_index_bench(c, 10, 1000, 750, &column_index);
+    run_page_index_bench(c, 10, 1000, 1000, &column_index);
+    run_page_index_bench(c, 10, 10000, 10, &column_index);
+    run_page_index_bench(c, 10, 10000, 50, &column_index);
+    run_page_index_bench(c, 10, 10000, 100, &column_index);
+    run_page_index_bench(c, 10, 10000, 500, &column_index);
+    run_page_index_bench(c, 10, 10000, 750, &column_index);
+    run_page_index_bench(c, 10, 10000, 1000, &column_index);
+    run_page_index_bench(c, 10, 10000, 5000, &column_index);
+    run_page_index_bench(c, 10, 10000, 7500, &column_index);
+    run_page_index_bench(c, 10, 10000, 10000, &column_index);
+}
+
+criterion_group!(benches, criterion_benchmark, page_index);
 criterion_main!(benches);

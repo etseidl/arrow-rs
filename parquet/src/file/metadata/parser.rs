@@ -257,8 +257,11 @@ pub(crate) fn parse_page_index(
     {
         return Ok(());
     }
+    let num_row_groups = metadata.num_row_groups();
+    let num_columns = metadata.file_metadata().schema_descr().num_columns();
     let mut builder = PageIndexBuilder::new_with_policy(
-        metadata,
+        num_row_groups,
+        num_columns,
         column_index_policy.clone(),
         offset_index_policy.clone(),
     );

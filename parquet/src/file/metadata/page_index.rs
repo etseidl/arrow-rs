@@ -17,8 +17,8 @@
 
 //! Page Index structures for efficient page-level skipping
 
+use crate::file::metadata::PageIndexPolicy;
 use crate::file::metadata::memory::HeapSize;
-use crate::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use crate::file::page_index::{
     column_index::ColumnIndexMetaData,
     offset_index::{OffsetIndexMetaData, PageLocation},
@@ -383,7 +383,7 @@ pub(crate) struct Keep {
 impl Keep {
     pub(crate) fn new(set: &BTreeSet<usize>, span: usize) -> Self {
         // TODO: need to error if span > max(u32)
-        let kept = if set.is_empty() {
+        let kept = if set.is_empty() || set.len() == span {
             None
         } else {
             let kept = set.iter().map(|i| *i as u32).collect::<Vec<u32>>();
@@ -717,11 +717,10 @@ pub struct PageIndexBuilder {
 
 impl PageIndexBuilder {
     fn storage_for_policy<T: Clone>(
-        metadata: &ParquetMetaData,
+        num_row_groups: usize,
+        num_columns: usize,
         policy: &PageIndexPolicy,
     ) -> Option<PageIndexStorage<T>> {
-        let num_row_groups = metadata.num_row_groups();
-        let num_columns = metadata.file_metadata().schema_descr().num_columns();
         match policy {
             PageIndexPolicy::Skip => None,
             PageIndexPolicy::Optional | PageIndexPolicy::Required => Some(
@@ -761,13 +760,22 @@ impl PageIndexBuilder {
     ///
     /// For sparse indexes, this can save a great deal of memory
     pub fn new_with_policy(
-        metadata: &ParquetMetaData,
+        num_row_groups: usize,
+        num_columns: usize,
         column_index_policy: PageIndexPolicy,
         offset_index_policy: PageIndexPolicy,
     ) -> Self {
         Self {
-            column_indexes: Self::storage_for_policy(metadata, &column_index_policy),
-            offset_indexes: Self::storage_for_policy(metadata, &offset_index_policy),
+            column_indexes: Self::storage_for_policy(
+                num_row_groups,
+                num_columns,
+                &column_index_policy,
+            ),
+            offset_indexes: Self::storage_for_policy(
+                num_row_groups,
+                num_columns,
+                &offset_index_policy,
+            ),
         }
     }
 
@@ -942,6 +950,16 @@ mod tests {
         run_test(10, 1000, 500, &ci);
         run_test(10, 1000, 750, &ci);
         run_test(10, 1000, 1000, &ci);
+
+        run_test(10, 10000, 10, &ci);
+        run_test(10, 10000, 50, &ci);
+        run_test(10, 10000, 100, &ci);
+        run_test(10, 10000, 500, &ci);
+        run_test(10, 10000, 750, &ci);
+        run_test(10, 10000, 1000, &ci);
+        run_test(10, 10000, 5000, &ci);
+        run_test(10, 10000, 7500, &ci);
+        run_test(10, 10000, 10000, &ci);
     }
 
     #[test]
