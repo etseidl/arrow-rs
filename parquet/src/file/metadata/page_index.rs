@@ -371,6 +371,9 @@ impl RowGroupPageIndex {
 /// `[None, None, Some(...), Some(...), None, Some(...)]` becomes `[2, 3, 5]`
 ///
 /// Position checking uses binary search for O(log n) lookup.
+///
+/// Implementation note: we can downsize to `u32` here because thrift encodes vector
+/// sizes with an `i32`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Keep {
     /// Sorted, deduplicated indexes of set positions
@@ -420,18 +423,19 @@ impl Keep {
     }
 }
 
-impl HeapSize for [u32] {
+impl HeapSize for Arc<[u32]> {
     fn heap_size(&self) -> usize {
-        std::mem::size_of_val(self)
+        // Arc stores weak and strong counts on the heap alongside an instance of T
+        // T = [u32], so that should be the size of a pointer + the size of the allocation
+        2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<*mut u32>()
+            + std::mem::size_of_val(self.as_ref())
     }
 }
 
 impl HeapSize for Keep {
     fn heap_size(&self) -> usize {
-        match &self.kept {
-            None => 0,
-            Some(indexes) => 3 * std::mem::size_of::<usize>() + indexes.heap_size(),
-        }
+        self.kept.heap_size()
     }
 }
 
