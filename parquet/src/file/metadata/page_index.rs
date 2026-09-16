@@ -889,10 +889,7 @@ mod tests {
     use super::{Keep, PageIndexStorage};
     use crate::{
         basic::BoundaryOrder,
-        file::{
-            metadata::HeapSize,
-            page_index::column_index::{ColumnIndexMetaData, PrimitiveColumnIndex},
-        },
+        file::page_index::column_index::{ColumnIndexMetaData, PrimitiveColumnIndex},
     };
 
     fn colidx_for_test() -> ColumnIndexMetaData {
@@ -908,58 +905,6 @@ mod tests {
         )
         .unwrap();
         ColumnIndexMetaData::INT32(ci)
-    }
-
-    fn run_test(num_rg: usize, num_col: usize, num_pop: usize, ci: &ColumnIndexMetaData) {
-        let mut d = PageIndexStorage::<ColumnIndexMetaData>::new_dense(num_rg, num_col);
-        let keep_rg = Keep::new_full(num_rg);
-        let keep_col_set = BTreeSet::from_iter(0..num_pop);
-        let keep_col = Keep::new(&keep_col_set, num_col);
-        let mut s = PageIndexStorage::<ColumnIndexMetaData>::new_sparse(keep_rg, keep_col);
-
-        for rg in 0..num_rg {
-            for c in 0..num_pop {
-                d.put_index(ci.clone(), rg, c);
-                s.put_index(ci.clone(), rg, c);
-            }
-        }
-
-        let dsz = d.heap_size();
-        let svsz = s.heap_size();
-        println!("rg: {num_rg} col: {num_pop}/{num_col} dense {dsz} sparse {svsz}");
-    }
-
-    #[test]
-    fn test_sizes() {
-        let ci = colidx_for_test();
-
-        run_test(10, 10, 1, &ci);
-        run_test(10, 10, 5, &ci);
-        run_test(10, 10, 10, &ci);
-
-        run_test(10, 100, 1, &ci);
-        run_test(10, 100, 5, &ci);
-        run_test(10, 100, 10, &ci);
-        run_test(10, 100, 50, &ci);
-        run_test(10, 100, 75, &ci);
-        run_test(10, 100, 100, &ci);
-
-        run_test(10, 1000, 10, &ci);
-        run_test(10, 1000, 50, &ci);
-        run_test(10, 1000, 100, &ci);
-        run_test(10, 1000, 500, &ci);
-        run_test(10, 1000, 750, &ci);
-        run_test(10, 1000, 1000, &ci);
-
-        run_test(10, 10000, 10, &ci);
-        run_test(10, 10000, 50, &ci);
-        run_test(10, 10000, 100, &ci);
-        run_test(10, 10000, 500, &ci);
-        run_test(10, 10000, 750, &ci);
-        run_test(10, 10000, 1000, &ci);
-        run_test(10, 10000, 5000, &ci);
-        run_test(10, 10000, 7500, &ci);
-        run_test(10, 10000, 10000, &ci);
     }
 
     #[test]

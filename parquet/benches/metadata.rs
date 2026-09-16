@@ -23,8 +23,8 @@ use parquet::basic::{BoundaryOrder, Encoding, PageType, Type as PhysicalType};
 use parquet::file::metadata::page_index::{PageIndexBuilder, PageIndexProvider};
 use parquet::file::metadata::{
     ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, LevelHistogram, PageEncodingStats,
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader,
-    ParquetMetaDataWriter, ParquetStatisticsPolicy, RowGroupMetaData,
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataOptions,
+    ParquetMetaDataReader, ParquetMetaDataWriter, ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
@@ -339,20 +339,36 @@ fn run_page_index_bench(
         PageIndexPolicy::only_columns(0..num_pop),
         PageIndexPolicy::Skip,
     );
-    let mut denss_builder = PageIndexBuilder::new(num_rg, num_col);
+    let mut dense_builder = PageIndexBuilder::new(num_rg, num_col);
 
     for rg in 0..num_rg {
         for c in 0..num_pop {
-            denss_builder.put_column_index(ci.clone(), rg, c);
+            dense_builder.put_column_index(ci.clone(), rg, c);
             sparse_builder.put_column_index(ci.clone(), rg, c);
         }
     }
 
-    let d = denss_builder.build();
+    let d = dense_builder.build();
     let s = sparse_builder.build();
 
+    // create dummy metadata to extract memory footprints
+    let schema_descr = parse_message_type("message empty{}")
+        .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
+        .unwrap();
+    let file_meta = FileMetaData::new(1, 0, None, None, schema_descr, None);
+
+    let dmeta = ParquetMetaDataBuilder::new(file_meta.clone())
+        .set_page_index(Some(Arc::new(d.clone())))
+        .build();
+    let dsz = dmeta.memory_size();
+
+    let smeta = ParquetMetaDataBuilder::new(file_meta)
+        .set_page_index(Some(Arc::new(s.clone())))
+        .build();
+    let ssz = smeta.memory_size();
+
     c.bench_function(
-        &format!("page_index_dense({num_rg},{num_pop}/{num_col})"),
+        &format!("page_index_dense({num_rg},{num_pop}/{num_col})(size={dsz})"),
         |b| {
             b.iter(|| {
                 // this should exist
@@ -364,8 +380,10 @@ fn run_page_index_bench(
     );
 
     c.bench_function(
-        &format!("page_index_sparse({num_rg},{num_pop}/{num_col})"),
+        &format!("page_index_sparse({num_rg},{num_pop}/{num_col})(size={ssz})"),
         |b| {
+            // note that the rust binary search implementation does not exit early, so
+            // we should get consistent times regardless of the position queried
             b.iter(|| {
                 black_box(s.column_index(0, 0));
                 black_box(s.column_index(num_rg - 1, num_col - 1));
