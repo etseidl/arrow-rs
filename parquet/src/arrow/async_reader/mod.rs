@@ -974,7 +974,7 @@ mod tests {
     use crate::arrow::{ArrowWriter, AsyncArrowWriter, ProjectionMask};
     use crate::file::metadata::PageIndexPolicy;
     use crate::file::metadata::ParquetMetaDataReader;
-    use crate::file::metadata::page_index::{PageIndex, PageIndexStorage};
+    use crate::file::metadata::page_index::{Grid, PageIndex};
     use crate::file::properties::WriterProperties;
     use arrow::compute::kernels::cmp::eq;
     use arrow::error::Result as ArrowResult;
@@ -1785,7 +1785,7 @@ mod tests {
             .await
             .unwrap();
 
-        let page_index = PageIndex::new(None, Some(PageIndexStorage::Dense(vec![])));
+        let page_index = PageIndex::new(None, Some(Grid::new_dense(0, 0)));
         metadata.set_page_index(Some(Arc::new(page_index)));
         let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let arrow_reader_metadata = ArrowReaderMetadata::try_new(metadata.into(), options).unwrap();

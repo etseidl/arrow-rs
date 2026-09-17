@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::file::metadata::page_index::{PageIndexProvider, PageIndexStorage};
+use crate::file::metadata::page_index::{Grid, PageIndexProvider};
 use crate::file::metadata::thrift::FileMeta;
 use crate::file::metadata::{ColumnChunkMetaData, PageIndex, RowGroupMetaData};
 use crate::schema::types::{SchemaDescPtr, SchemaDescriptor};
@@ -32,10 +32,7 @@ use crate::{
     file::column_crypto_metadata::ColumnCryptoMetaData,
     file::metadata::thrift::encryption::{AesGcmV1, EncryptionAlgorithm, FileCryptoMetaData},
 };
-use crate::{
-    errors::{ParquetError, Result},
-    file::page_index::column_index::ColumnIndexMetaData,
-};
+use crate::{errors::Result, file::page_index::column_index::ColumnIndexMetaData};
 
 use crate::{
     file::writer::{TrackedWrite, get_file_magic},
@@ -75,12 +72,9 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn write_offset_indexes(
         &mut self,
         page_index: &Arc<dyn PageIndexProvider>,
-    ) -> Result<PageIndexStorage<OffsetIndexMetaData>> {
+    ) -> Result<Grid<OffsetIndexMetaData>> {
         let mut offset_indexes =
-            PageIndexStorage::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
-        let PageIndexStorage::Dense(offidx_vec) = &mut offset_indexes else {
-            return Err(general_err!("offset index is the wrong form"));
-        };
+            Grid::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
 
         // we've already checked before calling that the offset indexes are populated
         assert!(page_index.has_offset_indexes());
@@ -103,7 +97,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
                     // set offset and index for offset index
                     column_metadata.offset_index_offset = Some(start_offset as i64);
                     column_metadata.offset_index_length = Some((end_offset - start_offset) as i32);
-                    offidx_vec[row_group_idx][column_idx] = Some(offset_index.clone());
+                    offset_indexes.insert(row_group_idx, column_idx, offset_index.clone());
                 }
             }
         }
@@ -118,12 +112,9 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn write_column_indexes(
         &mut self,
         page_index: &Arc<dyn PageIndexProvider>,
-    ) -> Result<PageIndexStorage<ColumnIndexMetaData>> {
+    ) -> Result<Grid<ColumnIndexMetaData>> {
         let mut column_indexes =
-            PageIndexStorage::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
-        let PageIndexStorage::Dense(colidx_vec) = &mut column_indexes else {
-            return Err(general_err!("column index is the wrong form"));
-        };
+            Grid::new_dense(self.row_groups.len(), self.schema_descr.num_columns());
 
         // we've already checked before calling that the column indexes are populated
         assert!(page_index.has_column_indexes());
@@ -149,7 +140,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
                         column_metadata.column_index_length =
                             Some((end_offset - start_offset) as i32);
                     }
-                    colidx_vec[row_group_idx][column_idx] = Some(column_index.clone());
+                    column_indexes.insert(row_group_idx, column_idx, column_index.clone());
                 }
             }
         }
@@ -160,7 +151,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn finalize_column_indexes(
         &mut self,
         page_index: Option<&Arc<dyn PageIndexProvider>>,
-    ) -> Result<Option<PageIndexStorage<ColumnIndexMetaData>>> {
+    ) -> Result<Option<Grid<ColumnIndexMetaData>>> {
         if page_index
             .as_ref()
             .is_none_or(|pi| !pi.has_column_indexes())
@@ -172,14 +163,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
         let column_indexes = self.write_column_indexes(page_index.as_ref().unwrap())?;
 
         // check to see if the index is `None` for every row group and column chunk
-        let all_none = match &column_indexes {
-            PageIndexStorage::Dense(index) => {
-                index.iter().all(|cii| cii.iter().all(|idx| idx.is_none()))
-            }
-            PageIndexStorage::Sparse(_) => return Err(general_err!("wrong form for column index")),
-        };
-
-        if all_none {
+        if column_indexes.is_empty() {
             Ok(None)
         } else {
             Ok(Some(column_indexes))
@@ -190,7 +174,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
     fn finalize_offset_indexes(
         &mut self,
         page_index: Option<&Arc<dyn PageIndexProvider>>,
-    ) -> Result<Option<PageIndexStorage<OffsetIndexMetaData>>> {
+    ) -> Result<Option<Grid<OffsetIndexMetaData>>> {
         if page_index
             .as_ref()
             .is_none_or(|pi| !pi.has_offset_indexes())
@@ -202,14 +186,7 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
         let offset_indexes = self.write_offset_indexes(page_index.as_ref().unwrap())?;
 
         // check to see if the index is `None` for every row group and column chunk
-        let all_none = match &offset_indexes {
-            PageIndexStorage::Dense(index) => {
-                index.iter().all(|oii| oii.iter().all(|idx| idx.is_none()))
-            }
-            PageIndexStorage::Sparse(_) => return Err(general_err!("wrong form for offset index")),
-        };
-
-        if all_none {
+        if offset_indexes.is_empty() {
             Ok(None)
         } else {
             Ok(Some(offset_indexes))
