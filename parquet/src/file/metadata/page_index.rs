@@ -408,9 +408,12 @@ impl Keep {
 
     /// Retrieve a position if set
     fn position(&self, idx: usize) -> Option<usize> {
-        match &self.kept {
+        // below CUTOFF elements, use linear search
+        const CUTOFF: usize = 32;
+        match self.kept.as_ref() {
             None => (idx < self.span as usize).then_some(idx),
-            Some(k) => k.binary_search(&u32::try_from(idx).ok()?).ok(),
+            Some(k) if k.len() > CUTOFF => k.binary_search(&u32::try_from(idx).ok()?).ok(),
+            Some(k) => k.iter().position(|&i| i == idx as u32),
         }
     }
 
