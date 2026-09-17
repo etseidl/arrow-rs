@@ -32,7 +32,8 @@ use crate::file::metadata::{
 use crate::file::page_index::column_index::ColumnIndexMetaData;
 use crate::file::page_index::index_reader::{decode_column_index, decode_offset_index};
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
-use bytes::Bytes;
+use crate::file::reader::ChunkReader;
+use crate::util::push_buffers::PushBuffers;
 
 /// Helper struct for metadata parsing
 ///
@@ -250,8 +251,7 @@ pub(crate) fn parse_page_index(
     metadata: &mut ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     offset_index_policy: PageIndexPolicy,
-    bytes: &Bytes,
-    start_offset: u64,
+    bytes: &PushBuffers,
 ) -> crate::errors::Result<()> {
     if column_index_policy == PageIndexPolicy::Skip && offset_index_policy == PageIndexPolicy::Skip
     {
@@ -266,22 +266,10 @@ pub(crate) fn parse_page_index(
         offset_index_policy.clone(),
     );
     if column_index_policy != PageIndexPolicy::Skip {
-        parse_column_index(
-            metadata,
-            column_index_policy,
-            &mut builder,
-            bytes,
-            start_offset,
-        )?;
+        parse_column_index(metadata, column_index_policy, &mut builder, bytes)?;
     }
     if offset_index_policy != PageIndexPolicy::Skip {
-        parse_offset_index(
-            metadata,
-            offset_index_policy,
-            &mut builder,
-            bytes,
-            start_offset,
-        )?;
+        parse_offset_index(metadata, offset_index_policy, &mut builder, bytes)?;
     }
 
     let page_index = builder.build();
@@ -297,8 +285,7 @@ fn parse_column_index(
     metadata: &ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     page_index_builder: &mut PageIndexBuilder,
-    bytes: &Bytes,
-    start_offset: u64,
+    bytes: &PushBuffers,
 ) -> crate::errors::Result<()> {
     if column_index_policy == PageIndexPolicy::Skip {
         return Ok(());
@@ -314,15 +301,9 @@ fn parse_column_index(
             }
             let col = rg.column(col_idx);
             if let Some(r) = col.column_index_range() {
-                let r_start = usize::try_from(r.start - start_offset)?;
-                let r_end = usize::try_from(r.end - start_offset)?;
-                let idx = inner::parse_single_column_index(
-                    &bytes[r_start..r_end],
-                    metadata,
-                    col,
-                    rg_idx,
-                    col_idx,
-                )?;
+                let idx_bytes = bytes.get_bytes(r.start, (r.end - r.start) as usize)?;
+                let idx =
+                    inner::parse_single_column_index(&idx_bytes, metadata, col, rg_idx, col_idx)?;
                 page_index_builder.put_column_index(idx, rg_idx, col_idx);
             }
         }
@@ -335,8 +316,7 @@ fn parse_offset_index(
     metadata: &ParquetMetaData,
     offset_index_policy: PageIndexPolicy,
     page_index_builder: &mut PageIndexBuilder,
-    bytes: &Bytes,
-    start_offset: u64,
+    bytes: &PushBuffers,
 ) -> crate::errors::Result<()> {
     if offset_index_policy == PageIndexPolicy::Skip {
         return Ok(());
@@ -352,15 +332,9 @@ fn parse_offset_index(
             }
             let col = rg.column(col_idx);
             if let Some(r) = col.offset_index_range() {
-                let r_start = usize::try_from(r.start - start_offset)?;
-                let r_end = usize::try_from(r.end - start_offset)?;
-                let idx = inner::parse_single_offset_index(
-                    &bytes[r_start..r_end],
-                    metadata,
-                    col,
-                    rg_idx,
-                    col_idx,
-                )?;
+                let idx_bytes = bytes.get_bytes(r.start, (r.end - r.start) as usize)?;
+                let idx =
+                    inner::parse_single_offset_index(&idx_bytes, metadata, col, rg_idx, col_idx)?;
                 page_index_builder.put_offset_index(idx, rg_idx, col_idx);
             } else if offset_index_policy == PageIndexPolicy::Required {
                 return Err(general_err!("missing offset index"));
