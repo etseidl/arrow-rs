@@ -747,6 +747,49 @@ mod tests {
         }
     }
 
+    /// Decode the metadata incrementally, with a partial page index, but coalesced
+    /// range request.
+    #[test]
+    fn test_metadata_decoder_incremental_partial_page_index_one_fetch() {
+        let file_len = TEST_FILE_DATA.len() as u64;
+        let mut metadata_decoder = ParquetMetaDataPushDecoder::try_new(file_len)
+            .unwrap()
+            .with_page_index_policy(PageIndexPolicy::only_columns([0]));
+        let ranges = expect_needs_data(metadata_decoder.try_decode());
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], test_file_len() - 8..test_file_len());
+        push_ranges_to_metadata_decoder(&mut metadata_decoder, ranges);
+
+        // expect the first request to read the footer
+        let ranges = expect_needs_data(metadata_decoder.try_decode());
+        push_ranges_to_metadata_decoder(&mut metadata_decoder, ranges);
+
+        // expect the second request to read the page indexes
+        let mut ranges = expect_needs_data(metadata_decoder.try_decode());
+        // one for column index and one for offset index for each row group
+        assert_eq!(ranges.len(), 4);
+        // collapse ranges into a single range
+        ranges.sort_by(|r1, r2| r1.start.cmp(&r2.start));
+        let range = ranges.first().unwrap().start..ranges.last().unwrap().end;
+        push_ranges_to_metadata_decoder(&mut metadata_decoder, vec![range]);
+
+        // expect the third request to read the actual data
+        let metadata = expect_data(metadata_decoder.try_decode());
+        expect_finished(metadata_decoder.try_decode());
+
+        assert_eq!(metadata.num_row_groups(), 2);
+        assert_eq!(metadata.row_group(0).num_rows(), 200);
+        assert_eq!(metadata.row_group(1).num_rows(), 200);
+        assert!(metadata.page_index().is_some());
+        let page_index = metadata.page_index().unwrap();
+        for rg in 0..metadata.num_row_groups() {
+            for col in 0..metadata.file_metadata().schema_descr().num_columns() {
+                assert_eq!(page_index.column_index(rg, col).is_some(), col == 0);
+                assert_eq!(page_index.offset_index(rg, col).is_some(), col == 0);
+            }
+        }
+    }
+
     static TEST_BATCH: LazyLock<RecordBatch> = LazyLock::new(|| {
         // Input batch has 400 rows, with 3 columns: "a", "b", "c"
         // Note c is a different types (so the data page sizes will be different)
