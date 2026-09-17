@@ -496,10 +496,7 @@ impl<T: Clone> Grid<T> {
     }
 
     /// Sets a value at the specified row and column
-    pub(crate) fn insert(&mut self, row: usize, col: usize, value: T)
-    where
-        T: Clone,
-    {
+    pub(crate) fn insert(&mut self, row: usize, col: usize, value: T) {
         let row_offset = self.rows.position(row);
         let col_offset = self.cols.position(col);
         if let Some(row_offset) = row_offset
