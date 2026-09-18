@@ -23,8 +23,9 @@ use parquet::basic::{BoundaryOrder, Encoding, PageType, Type as PhysicalType};
 use parquet::file::metadata::page_index::{PageIndexBuilder, PageIndexProvider};
 use parquet::file::metadata::{
     ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, LevelHistogram, PageEncodingStats,
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataOptions,
-    ParquetMetaDataReader, ParquetMetaDataWriter, ParquetStatisticsPolicy, RowGroupMetaData,
+    PageIndexPolicy, PageIndexSelection, ParquetMetaData, ParquetMetaDataBuilder,
+    ParquetMetaDataOptions, ParquetMetaDataReader, ParquetMetaDataWriter, ParquetStatisticsPolicy,
+    RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
@@ -196,8 +197,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("open(page index reduced columns)", |b| {
         b.iter(|| {
             let reader = ParquetMetaDataReader::new()
-                .with_column_index_policy(PageIndexPolicy::only_columns([0]))
-                .with_offset_index_policy(PageIndexPolicy::only_columns([0, 1, 4]));
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .with_column_index_selection(PageIndexSelection::columns([0]))
+                .with_offset_index_selection(PageIndexSelection::columns([0, 1, 4]));
             reader.parse_and_finish(&data).unwrap();
         })
     });
@@ -333,11 +335,11 @@ fn run_page_index_bench(
     ci: &ColumnIndexMetaData,
 ) {
     // create the sparse and dense builders
-    let mut sparse_builder = PageIndexBuilder::new_with_policy(
+    let mut sparse_builder = PageIndexBuilder::new_with_selection(
         num_rg,
         num_col,
-        PageIndexPolicy::only_columns(0..num_pop),
-        PageIndexPolicy::Skip,
+        PageIndexSelection::columns(0..num_pop),
+        PageIndexSelection::columns([]),
     );
     let mut dense_builder = PageIndexBuilder::new(num_rg, num_col);
 

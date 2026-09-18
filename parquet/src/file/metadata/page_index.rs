@@ -17,7 +17,7 @@
 
 //! Page Index structures for efficient page-level skipping
 
-use crate::file::metadata::PageIndexPolicy;
+use crate::file::metadata::PageIndexSelection;
 use crate::file::metadata::memory::HeapSize;
 use crate::file::page_index::{
     column_index::ColumnIndexMetaData,
@@ -386,10 +386,14 @@ pub(crate) struct Keep {
 impl Keep {
     pub(crate) fn new(set: &BTreeSet<usize>, span: usize) -> Self {
         // TODO: need to error if span > max(u32)
-        let kept = if set.is_empty() || set.len() == span {
+        let kept = set
+            .iter()
+            .filter(|&&idx| idx < span)
+            .map(|&idx| idx as u32)
+            .collect::<Vec<_>>();
+        let kept = if kept.len() == span {
             None
         } else {
-            let kept = set.iter().map(|i| *i as u32).collect::<Vec<u32>>();
             Some(Arc::from(kept))
         };
 
@@ -674,32 +678,20 @@ pub struct PageIndexBuilder {
 }
 
 impl PageIndexBuilder {
-    fn storage_for_policy<T: Clone>(
+    fn storage_for_selection<T: Clone>(
         num_row_groups: usize,
         num_columns: usize,
-        policy: &PageIndexPolicy,
+        selection: &PageIndexSelection,
     ) -> Option<Grid<T>> {
-        match policy {
-            PageIndexPolicy::Skip => None,
-            PageIndexPolicy::Optional | PageIndexPolicy::Required => {
-                Some(Grid::<T>::new_dense(num_row_groups, num_columns))
-            }
-            PageIndexPolicy::OnlyColumns(cols) => {
-                let keep_cols = Keep::new(cols.as_ref(), num_columns);
-                let keep_rows = Keep::new_full(num_row_groups);
-                Some(Grid::<T>::new(keep_rows, keep_cols))
-            }
-            PageIndexPolicy::OnlyRowGroupsColumns(rows, cols) => {
-                let keep_cols = Keep::new(cols.as_ref(), num_columns);
-                let keep_rows = Keep::new(rows.as_ref(), num_row_groups);
-                Some(Grid::<T>::new(keep_rows, keep_cols))
-            }
-            PageIndexPolicy::OnlyRowGroups(rows) => {
-                let keep_cols = Keep::new_full(num_columns);
-                let keep_rows = Keep::new(rows.as_ref(), num_row_groups);
-                Some(Grid::<T>::new(keep_rows, keep_cols))
-            }
-        }
+        let keep_rows = selection.selected_row_groups().map_or_else(
+            || Keep::new_full(num_row_groups),
+            |rows| Keep::new(rows, num_row_groups),
+        );
+        let keep_cols = selection.selected_columns().map_or_else(
+            || Keep::new_full(num_columns),
+            |cols| Keep::new(cols, num_columns),
+        );
+        Some(Grid::<T>::new(keep_rows, keep_cols))
     }
 
     /// Creates a new [`PageIndexBuilder`] with space allocated for both column and offset indexes
@@ -719,22 +711,22 @@ impl PageIndexBuilder {
     /// Creates a new [`PageIndexBuilder`] where storage is defined by the policy
     ///
     /// For sparse indexes, this can save a great deal of memory
-    pub fn new_with_policy(
+    pub fn new_with_selection(
         num_row_groups: usize,
         num_columns: usize,
-        column_index_policy: PageIndexPolicy,
-        offset_index_policy: PageIndexPolicy,
+        column_index_selection: PageIndexSelection,
+        offset_index_selection: PageIndexSelection,
     ) -> Self {
         Self {
-            column_indexes: Self::storage_for_policy(
+            column_indexes: Self::storage_for_selection(
                 num_row_groups,
                 num_columns,
-                &column_index_policy,
+                &column_index_selection,
             ),
-            offset_indexes: Self::storage_for_policy(
+            offset_indexes: Self::storage_for_selection(
                 num_row_groups,
                 num_columns,
-                &offset_index_policy,
+                &offset_index_selection,
             ),
         }
     }
@@ -897,6 +889,13 @@ mod tests {
         // Test out of bounds
         assert!(storage.get(20, 5).is_none());
         assert!(storage.get(0, 200).is_none());
+    }
+
+    #[test]
+    fn test_empty_keep_selects_nothing() {
+        let keep = Keep::new(&BTreeSet::new(), 10);
+        assert_eq!(keep.len(), 0);
+        assert_eq!(keep.position(0), None);
     }
 
     #[test]

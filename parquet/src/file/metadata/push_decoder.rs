@@ -22,7 +22,8 @@ use crate::errors::{ParquetError, Result};
 use crate::file::FOOTER_SIZE;
 use crate::file::metadata::parser::{MetadataParser, parse_page_index};
 use crate::file::metadata::{
-    ColumnChunkMetaData, FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
+    ColumnChunkMetaData, FooterTail, PageIndexPolicy, PageIndexSelection, ParquetMetaData,
+    ParquetMetaDataOptions,
 };
 use crate::file::reader::ChunkReader;
 use bytes::Bytes;
@@ -227,6 +228,8 @@ pub struct ParquetMetaDataPushDecoder {
     column_index_policy: PageIndexPolicy,
     /// policy for loading OffsetIndex (part of the PageIndex)
     offset_index_policy: PageIndexPolicy,
+    column_index_selection: PageIndexSelection,
+    offset_index_selection: PageIndexSelection,
     /// Underlying buffers
     buffers: crate::util::push_buffers::PushBuffers,
     /// Encryption API
@@ -251,6 +254,8 @@ impl ParquetMetaDataPushDecoder {
             state: DecodeState::ReadingFooter,
             column_index_policy: PageIndexPolicy::Optional,
             offset_index_policy: PageIndexPolicy::Optional,
+            column_index_selection: PageIndexSelection::all(),
+            offset_index_selection: PageIndexSelection::all(),
             buffers: crate::util::push_buffers::PushBuffers::new(file_len),
             metadata_parser: MetadataParser::new(),
         })
@@ -284,7 +289,7 @@ impl ParquetMetaDataPushDecoder {
     ///
     /// [Parquet page index]: https://github.com/apache/parquet-format/blob/master/PageIndex.md
     pub fn with_page_index_policy(mut self, page_index_policy: PageIndexPolicy) -> Self {
-        self.column_index_policy = page_index_policy.clone();
+        self.column_index_policy = page_index_policy;
         self.offset_index_policy = page_index_policy;
         self
     }
@@ -298,6 +303,25 @@ impl ParquetMetaDataPushDecoder {
     /// Set the policy for reading the OffsetIndex (part of the PageIndex)
     pub fn with_offset_index_policy(mut self, offset_index_policy: PageIndexPolicy) -> Self {
         self.offset_index_policy = offset_index_policy;
+        self
+    }
+
+    /// Select the row groups and columns for which both page index structures are read.
+    pub fn with_page_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.column_index_selection = selection.clone();
+        self.offset_index_selection = selection;
+        self
+    }
+
+    /// Select the row groups and columns for which column indexes are read.
+    pub fn with_column_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.column_index_selection = selection;
+        self
+    }
+
+    /// Select the row groups and columns for which offset indexes are read.
+    pub fn with_offset_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.offset_index_selection = selection;
         self
     }
 
@@ -411,8 +435,10 @@ impl ParquetMetaDataPushDecoder {
                     // the specified policies
                     let ranges = ranges_for_page_index(
                         &metadata,
-                        self.column_index_policy.clone(),
-                        self.offset_index_policy.clone(),
+                        self.column_index_policy,
+                        self.offset_index_policy,
+                        &self.column_index_selection,
+                        &self.offset_index_selection,
                     );
 
                     if ranges.is_empty() {
@@ -434,6 +460,8 @@ impl ParquetMetaDataPushDecoder {
                         &mut metadata,
                         self.column_index_policy.clone(),
                         self.offset_index_policy.clone(),
+                        self.column_index_selection.clone(),
+                        self.offset_index_selection.clone(),
                         &self.buffers,
                     )?;
                     self.state = DecodeState::Finished;
@@ -508,21 +536,23 @@ pub fn ranges_for_page_index(
     metadata: &ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     offset_index_policy: PageIndexPolicy,
+    column_index_selection: &PageIndexSelection,
+    offset_index_selection: &PageIndexSelection,
 ) -> Vec<Range<u64>> {
     let mut result = Vec::new();
 
     fn add_ranges<T>(
         metadata: &ParquetMetaData,
-        policy: &PageIndexPolicy,
+        selection: &PageIndexSelection,
         ranges: &mut Vec<Range<u64>>,
         f: T,
     ) where
         T: Fn(&ColumnChunkMetaData) -> Option<Range<u64>>,
     {
         for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
-            if policy.is_keep_row_group(rg_idx) {
+            if selection.includes_row_group(rg_idx) {
                 for (col_idx, col) in rg.columns().iter().enumerate() {
-                    if policy.is_keep_column(col_idx) {
+                    if selection.includes_column(col_idx) {
                         if let Some(range) = f(col) {
                             // ranges shouldn't overlap, so only check for contiguous ranges
                             // [s1..e1], [s2..e2] where e1 == s2
@@ -543,7 +573,7 @@ pub fn ranges_for_page_index(
     if column_index_policy != PageIndexPolicy::Skip {
         add_ranges(
             metadata,
-            &column_index_policy,
+            column_index_selection,
             &mut result,
             ColumnChunkMetaData::column_index_range,
         );
@@ -551,7 +581,7 @@ pub fn ranges_for_page_index(
     if offset_index_policy != PageIndexPolicy::Skip {
         add_ranges(
             metadata,
-            &offset_index_policy,
+            offset_index_selection,
             &mut result,
             ColumnChunkMetaData::offset_index_range,
         );
@@ -714,7 +744,8 @@ mod tests {
         let file_len = TEST_FILE_DATA.len() as u64;
         let mut metadata_decoder = ParquetMetaDataPushDecoder::try_new(file_len)
             .unwrap()
-            .with_page_index_policy(PageIndexPolicy::only_columns([0]));
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .with_page_index_selection(PageIndexSelection::columns([0]));
         let ranges = expect_needs_data(metadata_decoder.try_decode());
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], test_file_len() - 8..test_file_len());
@@ -754,7 +785,8 @@ mod tests {
         let file_len = TEST_FILE_DATA.len() as u64;
         let mut metadata_decoder = ParquetMetaDataPushDecoder::try_new(file_len)
             .unwrap()
-            .with_page_index_policy(PageIndexPolicy::only_columns([0]));
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .with_page_index_selection(PageIndexSelection::columns([0]));
         let ranges = expect_needs_data(metadata_decoder.try_decode());
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], test_file_len() - 8..test_file_len());

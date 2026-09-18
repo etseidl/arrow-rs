@@ -24,7 +24,9 @@ use parquet::arrow::arrow_reader::{
     RowSelectionPolicy,
 };
 use parquet::file::metadata::page_index::PageIndexProvider;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{
+    PageIndexPolicy, PageIndexSelection, ParquetMetaData, ParquetMetaDataReader,
+};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::index_reader::{decode_column_index, decode_offset_index};
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
@@ -374,8 +376,9 @@ fn test_parse_selected_columns() {
 
     // populate column 0 for column index and columns 0 & 2 for the offset index
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
-        .with_offset_index_policy(PageIndexPolicy::only_columns([0, 2]));
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::columns([0]))
+        .with_offset_index_selection(PageIndexSelection::columns([0, 2]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -408,8 +411,8 @@ fn test_parse_selected_columns_mixed() {
 
     // populate column 0 for column index and all columns for offset index
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
-        .with_offset_index_policy(PageIndexPolicy::Required);
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::columns([0]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -442,7 +445,8 @@ fn test_parse_selected_row_groups() {
 
     // populate indexes for row groups 0 and 2
     let mut reader = ParquetMetaDataReader::new()
-        .with_page_index_policy(PageIndexPolicy::only_row_groups([0, 2]));
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_page_index_selection(PageIndexSelection::row_groups([0, 2]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -473,8 +477,9 @@ fn test_parse_selected_row_groups_and_columns() {
     // populate only row group 1, column index gets column 0, offset index gets
     // columns 0 and 2.
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_row_groups_and_columns([1], [0]))
-        .with_offset_index_policy(PageIndexPolicy::only_row_groups_and_columns([1], [0, 2]));
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::row_groups_and_columns([1], [0]))
+        .with_offset_index_selection(PageIndexSelection::row_groups_and_columns([1], [0, 2]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -535,8 +540,8 @@ fn test_page_index_sizes() {
 
     // populate column 0 for column index and all columns for offset index
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
-        .with_offset_index_policy(PageIndexPolicy::Required);
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::columns([0]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -549,8 +554,9 @@ fn test_page_index_sizes() {
 
     // populate column 0 for column index and columns 0 & 2 for the offset index
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_columns([0]))
-        .with_offset_index_policy(PageIndexPolicy::only_columns([0, 2]));
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::columns([0]))
+        .with_offset_index_selection(PageIndexSelection::columns([0, 2]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();
@@ -564,8 +570,9 @@ fn test_page_index_sizes() {
     // populate only row group 1, column index gets column 0, offset index gets
     // columns 0 and 2.
     let mut reader = ParquetMetaDataReader::new()
-        .with_column_index_policy(PageIndexPolicy::only_row_groups_and_columns([1], [0]))
-        .with_offset_index_policy(PageIndexPolicy::only_row_groups_and_columns([1], [0, 2]));
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .with_column_index_selection(PageIndexSelection::row_groups_and_columns([1], [0]))
+        .with_offset_index_selection(PageIndexSelection::row_groups_and_columns([1], [0, 2]));
 
     // parse metadata
     reader.try_parse(&file).unwrap();

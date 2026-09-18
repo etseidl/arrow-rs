@@ -45,8 +45,8 @@ use crate::column::page::{PageIterator, PageReader};
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader,
-    ParquetStatisticsPolicy, RowGroupMetaData,
+    PageIndexPolicy, PageIndexSelection, ParquetMetaData, ParquetMetaDataOptions,
+    ParquetMetaDataReader, ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
@@ -595,6 +595,8 @@ pub struct ArrowReaderOptions {
 
     pub(crate) column_index: PageIndexPolicy,
     pub(crate) offset_index: PageIndexPolicy,
+    pub(crate) column_index_selection: PageIndexSelection,
+    pub(crate) offset_index_selection: PageIndexSelection,
 
     /// Options to control reading of Parquet metadata
     metadata_options: ParquetMetaDataOptions,
@@ -748,7 +750,7 @@ impl ArrowReaderOptions {
     /// This method sets the same policy for both. For fine-grained control, use
     /// [`Self::with_column_index_policy`] and [`Self::with_offset_index_policy`].
     pub fn with_page_index_policy(self, policy: PageIndexPolicy) -> Self {
-        self.with_column_index_policy(policy.clone())
+        self.with_column_index_policy(policy)
             .with_offset_index_policy(policy)
     }
 
@@ -771,6 +773,24 @@ impl ArrowReaderOptions {
     /// [OffsetIndex]: https://github.com/apache/parquet-format/blob/master/PageIndex.md
     pub fn with_offset_index_policy(mut self, policy: PageIndexPolicy) -> Self {
         self.offset_index = policy;
+        self
+    }
+
+    /// Selects the row groups and columns for which both page index structures are read.
+    pub fn with_page_index_selection(self, selection: PageIndexSelection) -> Self {
+        self.with_column_index_selection(selection.clone())
+            .with_offset_index_selection(selection)
+    }
+
+    /// Selects the row groups and columns for which column indexes are read.
+    pub fn with_column_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.column_index_selection = selection;
+        self
+    }
+
+    /// Selects the row groups and columns for which offset indexes are read.
+    pub fn with_offset_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.offset_index_selection = selection;
         self
     }
 
@@ -913,7 +933,7 @@ impl ArrowReaderOptions {
     /// This can be set via [`with_offset_index_policy`][Self::with_offset_index_policy]
     /// or [`with_page_index_policy`][Self::with_page_index_policy].
     pub fn offset_index_policy(&self) -> PageIndexPolicy {
-        self.offset_index.clone()
+        self.offset_index
     }
 
     /// Retrieve the currently set [`PageIndexPolicy`] for the column index.
@@ -921,7 +941,17 @@ impl ArrowReaderOptions {
     /// This can be set via [`with_column_index_policy`][Self::with_column_index_policy]
     /// or [`with_page_index_policy`][Self::with_page_index_policy].
     pub fn column_index_policy(&self) -> PageIndexPolicy {
-        self.column_index.clone()
+        self.column_index
+    }
+
+    /// Retrieve the selection used when reading offset indexes.
+    pub fn offset_index_selection(&self) -> &PageIndexSelection {
+        &self.offset_index_selection
+    }
+
+    /// Retrieve the selection used when reading column indexes.
+    pub fn column_index_selection(&self) -> &PageIndexSelection {
+        &self.column_index_selection
     }
 
     /// Retrieve the currently set metadata decoding options.
@@ -970,7 +1000,9 @@ impl ParquetMetaDataReader {
         {
             self = self
                 .with_column_index_policy(options.column_index_policy())
-                .with_offset_index_policy(options.offset_index_policy());
+                .with_offset_index_policy(options.offset_index_policy())
+                .with_column_index_selection(options.column_index_selection.clone())
+                .with_offset_index_selection(options.offset_index_selection.clone());
         }
 
         self
@@ -1019,6 +1051,8 @@ impl ArrowReaderMetadata {
         let metadata = ParquetMetaDataReader::new()
             .with_column_index_policy(options.column_index_policy())
             .with_offset_index_policy(options.offset_index_policy())
+            .with_column_index_selection(options.column_index_selection.clone())
+            .with_offset_index_selection(options.offset_index_selection.clone())
             .with_metadata_options(Some(options.metadata_options.clone()));
         #[cfg(feature = "encryption")]
         let metadata = metadata.with_decryption_properties(

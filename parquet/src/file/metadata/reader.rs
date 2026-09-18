@@ -72,6 +72,8 @@ pub struct ParquetMetaDataReader {
     metadata: Option<ParquetMetaData>,
     column_index: PageIndexPolicy,
     offset_index: PageIndexPolicy,
+    column_index_selection: PageIndexSelection,
+    offset_index_selection: PageIndexSelection,
     prefetch_hint: Option<usize>,
     metadata_options: Option<Arc<ParquetMetaDataOptions>>,
     // Size of the serialized thrift metadata plus the 8 byte footer. Only set if
@@ -82,7 +84,7 @@ pub struct ParquetMetaDataReader {
 }
 
 /// Describes the policy for reading page indexes
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageIndexPolicy {
     /// Do not read the page index.
     #[default]
@@ -94,82 +96,67 @@ pub enum PageIndexPolicy {
     /// Only enforced for the offset index; this is the same as [`Self::Optional`]
     /// for the column index.
     Required,
-    /// Behaves as [`Self::Required`] for the listed column indexes, [`Self::Skip`] otherwise
-    OnlyColumns(Arc<BTreeSet<usize>>),
-    /// Behaves as [`Self::Required`] for the listed row group indexes, [`Self::Skip`] otherwise
-    OnlyRowGroups(Arc<BTreeSet<usize>>),
-    /// Behaves as [`Self::Required`] for the listed row group and column indexes,
-    /// [`Self::Skip`] otherwise
-    OnlyRowGroupsColumns(Arc<BTreeSet<usize>>, Arc<BTreeSet<usize>>),
 }
 
-impl PageIndexPolicy {
-    /// Create a `PageIndexPolicy` to skip all columns except those in `keep`.
-    ///
-    /// If `keep` is empty, then this returns [`Self::Skip`]
-    pub fn only_columns(keep: impl IntoIterator<Item = usize>) -> Self {
-        let keep_set: BTreeSet<usize> = keep.into_iter().collect();
-        if keep_set.is_empty() {
-            Self::Skip
-        } else {
-            Self::OnlyColumns(Arc::new(keep_set))
+/// Selects the row groups and columns for which page indexes are read.
+///
+/// This is independent of [`PageIndexPolicy`], which controls whether selected
+/// indexes are optional or required. By default, all row groups and columns are selected.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageIndexSelection {
+    row_groups: Option<Arc<BTreeSet<usize>>>,
+    columns: Option<Arc<BTreeSet<usize>>>,
+}
+
+impl PageIndexSelection {
+    /// Select all row groups and columns.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Select page indexes for only the listed columns.
+    pub fn columns(columns: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            row_groups: None,
+            columns: Some(Arc::new(columns.into_iter().collect())),
         }
     }
 
-    /// Test whether a given column is in the "keep" set.
-    pub fn is_keep_column(&self, col_idx: usize) -> bool {
-        match self {
-            Self::OnlyColumns(cols) | Self::OnlyRowGroupsColumns(_, cols) => {
-                cols.contains(&col_idx)
-            }
-            Self::Skip => false,
-            _ => true,
+    /// Select page indexes for only the listed row groups.
+    pub fn row_groups(row_groups: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            row_groups: Some(Arc::new(row_groups.into_iter().collect())),
+            columns: None,
         }
     }
 
-    /// Create a `PageIndexPolicy` to skip all row groups except those in `keep`.
-    ///
-    /// If `keep` is empty, then this returns [`Self::Skip`]
-    pub fn only_row_groups(keep: impl IntoIterator<Item = usize>) -> Self {
-        let keep_set: BTreeSet<usize> = keep.into_iter().collect();
-        if keep_set.is_empty() {
-            Self::Skip
-        } else {
-            Self::OnlyRowGroups(Arc::new(keep_set))
-        }
-    }
-
-    /// Test whether a given row group is in the "keep" set.
-    pub fn is_keep_row_group(&self, row_group_idx: usize) -> bool {
-        match self {
-            Self::OnlyRowGroups(rowgroups) | Self::OnlyRowGroupsColumns(rowgroups, _) => {
-                rowgroups.contains(&row_group_idx)
-            }
-            Self::Skip => false,
-            _ => true,
-        }
-    }
-
-    /// Create a `PageIndexPolicy` to skip all row groups and columns except those in
-    /// `keep_row_groups` and `keep_columns`.
-    ///
-    /// If both sets are empty then this returns [`Self::Skip`]
-    /// If `keep_row_groups` is empty this returns [`Self::OnlyColumns`]
-    /// If `keep_columns` is empty this returns [`Self::OnlyRowGroups`]
-    pub fn only_row_groups_and_columns(
-        keep_row_groups: impl IntoIterator<Item = usize>,
-        keep_columns: impl IntoIterator<Item = usize>,
+    /// Select page indexes for only the listed row groups and columns.
+    pub fn row_groups_and_columns(
+        row_groups: impl IntoIterator<Item = usize>,
+        columns: impl IntoIterator<Item = usize>,
     ) -> Self {
-        let rg_set: BTreeSet<usize> = keep_row_groups.into_iter().collect();
-        let col_set: BTreeSet<usize> = keep_columns.into_iter().collect();
-        let rg_set = Arc::new(rg_set);
-        let col_set = Arc::new(col_set);
-        match (rg_set.is_empty(), col_set.is_empty()) {
-            (true, true) => Self::Skip,
-            (true, false) => Self::OnlyColumns(col_set),
-            (false, true) => Self::OnlyRowGroups(rg_set),
-            (false, false) => Self::OnlyRowGroupsColumns(rg_set, col_set),
+        Self {
+            row_groups: Some(Arc::new(row_groups.into_iter().collect())),
+            columns: Some(Arc::new(columns.into_iter().collect())),
         }
+    }
+
+    pub(crate) fn includes_row_group(&self, idx: usize) -> bool {
+        self.row_groups
+            .as_ref()
+            .is_none_or(|keep| keep.contains(&idx))
+    }
+
+    pub(crate) fn includes_column(&self, idx: usize) -> bool {
+        self.columns.as_ref().is_none_or(|keep| keep.contains(&idx))
+    }
+
+    pub(crate) fn selected_row_groups(&self) -> Option<&BTreeSet<usize>> {
+        self.row_groups.as_deref()
+    }
+
+    pub(crate) fn selected_columns(&self) -> Option<&BTreeSet<usize>> {
+        self.columns.as_deref()
     }
 }
 
@@ -199,7 +186,7 @@ impl ParquetMetaDataReader {
 
     /// Sets the [`PageIndexPolicy`] for the column and offset indexes
     pub fn with_page_index_policy(self, policy: PageIndexPolicy) -> Self {
-        self.with_column_index_policy(policy.clone())
+        self.with_column_index_policy(policy)
             .with_offset_index_policy(policy)
     }
 
@@ -212,6 +199,24 @@ impl ParquetMetaDataReader {
     /// Sets the [`PageIndexPolicy`] for the offset index
     pub fn with_offset_index_policy(mut self, policy: PageIndexPolicy) -> Self {
         self.offset_index = policy;
+        self
+    }
+
+    /// Selects the row groups and columns for which both page index structures are read.
+    pub fn with_page_index_selection(self, selection: PageIndexSelection) -> Self {
+        self.with_column_index_selection(selection.clone())
+            .with_offset_index_selection(selection)
+    }
+
+    /// Selects the row groups and columns for which column indexes are read.
+    pub fn with_column_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.column_index_selection = selection;
+        self
+    }
+
+    /// Selects the row groups and columns for which offset indexes are read.
+    pub fn with_offset_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.offset_index_selection = selection;
         self
     }
 
@@ -417,8 +422,10 @@ impl ParquetMetaDataReader {
         };
 
         let push_decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
-            .with_offset_index_policy(self.offset_index.clone())
-            .with_column_index_policy(self.column_index.clone())
+            .with_offset_index_policy(self.offset_index)
+            .with_column_index_policy(self.column_index)
+            .with_offset_index_selection(self.offset_index_selection.clone())
+            .with_column_index_selection(self.column_index_selection.clone())
             .with_metadata_options(self.metadata_options.clone());
         let mut push_decoder = self.prepare_push_decoder(push_decoder);
 
@@ -564,8 +571,10 @@ impl ParquetMetaDataReader {
         // this is ok since the offsets in the metadata are always valid
         let file_size = u64::MAX;
         let push_decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
-            .with_offset_index_policy(self.offset_index.clone())
-            .with_column_index_policy(self.column_index.clone())
+            .with_offset_index_policy(self.offset_index)
+            .with_column_index_policy(self.column_index)
+            .with_offset_index_selection(self.offset_index_selection.clone())
+            .with_column_index_selection(self.column_index_selection.clone())
             .with_metadata_options(self.metadata_options.clone());
         let mut push_decoder = self.prepare_push_decoder(push_decoder);
 
