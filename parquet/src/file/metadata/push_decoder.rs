@@ -228,7 +228,9 @@ pub struct ParquetMetaDataPushDecoder {
     column_index_policy: PageIndexPolicy,
     /// policy for loading OffsetIndex (part of the PageIndex)
     offset_index_policy: PageIndexPolicy,
+    /// which rows and columns of the column index should be read
     column_index_selection: PageIndexSelection,
+    /// which rows and columns of the offset index should be read
     offset_index_selection: PageIndexSelection,
     /// Underlying buffers
     buffers: crate::util::push_buffers::PushBuffers,
