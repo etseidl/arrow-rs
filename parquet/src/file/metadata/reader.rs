@@ -125,29 +125,39 @@ impl PageIndexSelection {
     }
 
     /// Select page indexes for only the listed columns.
+    ///
+    /// Any indices in `columns` that are less than zero will be ignored.
     pub fn columns(columns: impl IntoIterator<Item = i32>) -> Self {
         Self {
             row_groups: None,
-            columns: Some(Arc::new(columns.into_iter().collect())),
+            columns: Some(Arc::new(columns.into_iter().filter(|&i| i >= 0).collect())),
         }
     }
 
     /// Select page indexes for only the listed row groups.
+    ///
+    /// Any indices in `row_groups` that are less than zero will be ignored.
     pub fn row_groups(row_groups: impl IntoIterator<Item = i32>) -> Self {
         Self {
-            row_groups: Some(Arc::new(row_groups.into_iter().collect())),
+            row_groups: Some(Arc::new(
+                row_groups.into_iter().filter(|&i| i >= 0).collect(),
+            )),
             columns: None,
         }
     }
 
     /// Select page indexes for only the listed row groups and columns.
+    ///
+    /// Any indices in `row_groups` or `columns that are less than zero will be ignored.
     pub fn row_groups_and_columns(
         row_groups: impl IntoIterator<Item = i32>,
         columns: impl IntoIterator<Item = i32>,
     ) -> Self {
         Self {
-            row_groups: Some(Arc::new(row_groups.into_iter().collect())),
-            columns: Some(Arc::new(columns.into_iter().collect())),
+            row_groups: Some(Arc::new(
+                row_groups.into_iter().filter(|&i| i >= 0).collect(),
+            )),
+            columns: Some(Arc::new(columns.into_iter().filter(|&i| i >= 0).collect())),
         }
     }
 
@@ -161,6 +171,7 @@ impl PageIndexSelection {
             .is_none_or(|keep| keep.contains(&idx))
     }
 
+    // test if `idx` is in the column set. returns false if idx > i32::MAX
     pub(crate) fn includes_column(&self, idx: usize) -> bool {
         let Ok(idx) = i32::try_from(idx) else {
             return false;
