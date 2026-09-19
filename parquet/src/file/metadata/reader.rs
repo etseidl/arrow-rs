@@ -118,6 +118,7 @@ pub struct PageIndexSelection {
     columns: Option<Arc<BTreeSet<i32>>>,
 }
 
+// TODO(ets): add unit tests for PageIndexSelection
 impl PageIndexSelection {
     /// Select all row groups and columns.
     pub fn all() -> Self {
@@ -179,6 +180,7 @@ impl PageIndexSelection {
         self.columns.as_ref().is_none_or(|keep| keep.contains(&idx))
     }
 
+    // FIXME(ets): these will be used later
     /*pub(crate) fn selected_row_groups(&self) -> Option<&BTreeSet<usize>> {
         self.row_groups.as_deref()
     }
