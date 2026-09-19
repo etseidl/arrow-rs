@@ -460,10 +460,10 @@ impl ParquetMetaDataPushDecoder {
 
                     parse_page_index(
                         &mut metadata,
-                        self.column_index_policy.clone(),
-                        self.offset_index_policy.clone(),
-                        self.column_index_selection.clone(),
-                        self.offset_index_selection.clone(),
+                        self.column_index_policy,
+                        self.offset_index_policy,
+                        &self.column_index_selection,
+                        &self.offset_index_selection,
                         &self.buffers,
                     )?;
                     self.state = DecodeState::Finished;

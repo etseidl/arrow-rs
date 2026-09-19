@@ -252,8 +252,8 @@ pub(crate) fn parse_page_index(
     metadata: &mut ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     offset_index_policy: PageIndexPolicy,
-    column_index_selection: PageIndexSelection,
-    offset_index_selection: PageIndexSelection,
+    column_index_selection: &PageIndexSelection,
+    offset_index_selection: &PageIndexSelection,
     bytes: &PushBuffers,
 ) -> crate::errors::Result<()> {
     if column_index_policy == PageIndexPolicy::Skip && offset_index_policy == PageIndexPolicy::Skip
@@ -272,7 +272,7 @@ pub(crate) fn parse_page_index(
         parse_column_index(
             metadata,
             column_index_policy,
-            &column_index_selection,
+            column_index_selection,
             &mut builder,
             bytes,
         )?;
@@ -281,7 +281,7 @@ pub(crate) fn parse_page_index(
         parse_offset_index(
             metadata,
             offset_index_policy,
-            &offset_index_selection,
+            offset_index_selection,
             &mut builder,
             bytes,
         )?;
