@@ -113,8 +113,9 @@ impl From<bool> for PageIndexPolicy {
 /// indexes are optional or required. By default, all row groups and columns are selected.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PageIndexSelection {
-    row_groups: Option<Arc<BTreeSet<usize>>>,
-    columns: Option<Arc<BTreeSet<usize>>>,
+    // using i32 because that's how thrift vectors are sized
+    row_groups: Option<Arc<BTreeSet<i32>>>,
+    columns: Option<Arc<BTreeSet<i32>>>,
 }
 
 impl PageIndexSelection {
@@ -124,7 +125,7 @@ impl PageIndexSelection {
     }
 
     /// Select page indexes for only the listed columns.
-    pub fn columns(columns: impl IntoIterator<Item = usize>) -> Self {
+    pub fn columns(columns: impl IntoIterator<Item = i32>) -> Self {
         Self {
             row_groups: None,
             columns: Some(Arc::new(columns.into_iter().collect())),
@@ -132,7 +133,7 @@ impl PageIndexSelection {
     }
 
     /// Select page indexes for only the listed row groups.
-    pub fn row_groups(row_groups: impl IntoIterator<Item = usize>) -> Self {
+    pub fn row_groups(row_groups: impl IntoIterator<Item = i32>) -> Self {
         Self {
             row_groups: Some(Arc::new(row_groups.into_iter().collect())),
             columns: None,
@@ -141,8 +142,8 @@ impl PageIndexSelection {
 
     /// Select page indexes for only the listed row groups and columns.
     pub fn row_groups_and_columns(
-        row_groups: impl IntoIterator<Item = usize>,
-        columns: impl IntoIterator<Item = usize>,
+        row_groups: impl IntoIterator<Item = i32>,
+        columns: impl IntoIterator<Item = i32>,
     ) -> Self {
         Self {
             row_groups: Some(Arc::new(row_groups.into_iter().collect())),
@@ -150,13 +151,20 @@ impl PageIndexSelection {
         }
     }
 
+    // test if `idx` is in the row group set. returns false if idx > i32::MAX
     pub(crate) fn includes_row_group(&self, idx: usize) -> bool {
+        let Ok(idx) = i32::try_from(idx) else {
+            return false;
+        };
         self.row_groups
             .as_ref()
             .is_none_or(|keep| keep.contains(&idx))
     }
 
     pub(crate) fn includes_column(&self, idx: usize) -> bool {
+        let Ok(idx) = i32::try_from(idx) else {
+            return false;
+        };
         self.columns.as_ref().is_none_or(|keep| keep.contains(&idx))
     }
 
