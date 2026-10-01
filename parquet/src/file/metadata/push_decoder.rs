@@ -20,6 +20,7 @@ use crate::DecodeResult;
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::FOOTER_SIZE;
+use crate::file::metadata::page_index::PageIndex;
 use crate::file::metadata::parser::{MetadataParser, parse_page_index};
 use crate::file::metadata::{
     ColumnChunkMask, FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
@@ -464,8 +465,8 @@ impl ParquetMetaDataPushDecoder {
 
                     let buffer = self.get_bytes(&page_index_range)?;
                     let offset = page_index_range.start;
-                    parse_page_index(
-                        &mut metadata,
+                    let page_index = parse_page_index(
+                        &metadata,
                         self.column_index_policy,
                         self.offset_index_policy,
                         &self.column_index_mask,
@@ -473,12 +474,74 @@ impl ParquetMetaDataPushDecoder {
                         &buffer,
                         offset,
                     )?;
+                    // install the new page index or clear the old one
+                    if let Some(page_index) = page_index {
+                        metadata.set_page_index(Some(Arc::new(page_index)));
+                    } else {
+                        metadata.set_page_index(None);
+                    }
+
                     self.state = DecodeState::Finished;
                     return Ok(DecodeResult::Data(*metadata));
                 }
 
                 DecodeState::Finished => return Ok(DecodeResult::Finished),
                 DecodeState::Intermediate => {
+                    return Err(general_err!(
+                        "ParquetMetaDataPushDecoder: internal error, invalid state"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Try to decode the page indexes from the pushed data, returning the
+    /// decoded [`PageIndex`] or an error if not enough data is available.
+    /// This can only be called after [`Self::try_new_with_metadata`].
+    pub fn try_decode_page_index(&mut self) -> Result<DecodeResult<Option<PageIndex>>> {
+        // stripped down state machine copied from try_decode. need to be in the
+        // `ReadingPageIndex` state initially or this will error.
+        loop {
+            match std::mem::replace(&mut self.state, DecodeState::Intermediate) {
+                DecodeState::ReadingPageIndex(metadata) => {
+                    // First determine if any page indexes are needed based on
+                    // the specified policies
+                    let range = range_for_page_index(
+                        &metadata,
+                        self.column_index_policy,
+                        self.offset_index_policy,
+                        &self.column_index_mask,
+                        &self.offset_index_mask,
+                    );
+
+                    let Some(page_index_range) = range else {
+                        self.state = DecodeState::Finished;
+                        return Ok(DecodeResult::Data(None));
+                    };
+
+                    if !self.buffers.has_range(&page_index_range) {
+                        self.state = DecodeState::ReadingPageIndex(metadata);
+                        return Ok(needs_range(page_index_range));
+                    }
+
+                    let buffer = self.get_bytes(&page_index_range)?;
+                    let offset = page_index_range.start;
+                    let page_index = parse_page_index(
+                        &metadata,
+                        self.column_index_policy,
+                        self.offset_index_policy,
+                        &self.column_index_mask,
+                        &self.offset_index_mask,
+                        &buffer,
+                        offset,
+                    )?;
+
+                    self.state = DecodeState::Finished;
+                    return Ok(DecodeResult::Data(page_index));
+                }
+
+                DecodeState::Finished => return Ok(DecodeResult::Finished),
+                _ => {
                     return Err(general_err!(
                         "ParquetMetaDataPushDecoder: internal error, invalid state"
                     ));
@@ -501,7 +564,7 @@ impl ParquetMetaDataPushDecoder {
 }
 
 /// returns a DecodeResults that describes needing the given range
-fn needs_range(range: Range<u64>) -> DecodeResult<ParquetMetaData> {
+fn needs_range<T: std::fmt::Debug>(range: Range<u64>) -> DecodeResult<T> {
     DecodeResult::NeedsData(vec![range])
 }
 
