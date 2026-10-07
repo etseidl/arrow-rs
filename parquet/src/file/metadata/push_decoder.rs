@@ -618,52 +618,48 @@ assert!(page_index.is_some());
     pub fn try_decode_page_index(&mut self) -> Result<DecodeResult<Option<PageIndex>>> {
         // stripped down state machine copied from try_decode. need to be in the
         // `ReadingPageIndex` state initially or this will error.
-        loop {
-            match std::mem::replace(&mut self.state, DecodeState::Intermediate) {
-                DecodeState::ReadingPageIndex(metadata) => {
-                    // First determine if any page indexes are needed based on
-                    // the specified policies
-                    let range = range_for_page_index(
-                        &metadata,
-                        self.column_index_policy,
-                        self.offset_index_policy,
-                        &self.column_index_mask,
-                        &self.offset_index_mask,
-                    );
+        match std::mem::replace(&mut self.state, DecodeState::Intermediate) {
+            DecodeState::ReadingPageIndex(metadata) => {
+                // First determine if any page indexes are needed based on
+                // the specified policies
+                let range = range_for_page_index(
+                    &metadata,
+                    self.column_index_policy,
+                    self.offset_index_policy,
+                    &self.column_index_mask,
+                    &self.offset_index_mask,
+                );
 
-                    let Some(page_index_range) = range else {
-                        self.state = DecodeState::Finished;
-                        return Ok(DecodeResult::Data(None));
-                    };
-
-                    if !self.buffers.has_range(&page_index_range) {
-                        self.state = DecodeState::ReadingPageIndex(metadata);
-                        return Ok(needs_range(page_index_range));
-                    }
-
-                    let buffer = self.get_bytes(&page_index_range)?;
-                    let offset = page_index_range.start;
-                    let page_index = parse_page_index(
-                        &metadata,
-                        self.column_index_policy,
-                        self.offset_index_policy,
-                        &self.column_index_mask,
-                        &self.offset_index_mask,
-                        &buffer,
-                        offset,
-                    )?;
-
+                let Some(page_index_range) = range else {
                     self.state = DecodeState::Finished;
-                    return Ok(DecodeResult::Data(page_index));
+                    return Ok(DecodeResult::Data(None));
+                };
+
+                if !self.buffers.has_range(&page_index_range) {
+                    self.state = DecodeState::ReadingPageIndex(metadata);
+                    return Ok(needs_range(page_index_range));
                 }
 
-                DecodeState::Finished => return Ok(DecodeResult::Finished),
-                _ => {
-                    return Err(general_err!(
-                        "ParquetMetaDataPushDecoder: internal error, invalid state"
-                    ));
-                }
+                let buffer = self.get_bytes(&page_index_range)?;
+                let offset = page_index_range.start;
+                let page_index = parse_page_index(
+                    &metadata,
+                    self.column_index_policy,
+                    self.offset_index_policy,
+                    &self.column_index_mask,
+                    &self.offset_index_mask,
+                    &buffer,
+                    offset,
+                )?;
+
+                self.state = DecodeState::Finished;
+                Ok(DecodeResult::Data(page_index))
             }
+
+            DecodeState::Finished => Ok(DecodeResult::Finished),
+            _ => Err(general_err!(
+                "ParquetMetaDataPushDecoder: internal error, invalid state"
+            )),
         }
     }
 

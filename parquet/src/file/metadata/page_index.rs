@@ -556,6 +556,7 @@ impl PageIndex {
     /// Each entry contains its `(row_group_index, column_index)` coordinate and the shared index
     /// metadata. This can be used to transfer parsed indexes into a cache without cloning the
     /// metadata or allocating new [`Arc`]s. Entry order is unspecified.
+    #[expect(clippy::type_complexity)]
     pub fn into_index_entries(
         self,
     ) -> (
