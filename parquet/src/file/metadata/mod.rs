@@ -2122,9 +2122,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3280;
+        let bigger_expected_size = 3576;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3448;
+        let bigger_expected_size = 3744;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2300,5 +2300,24 @@ mod tests {
         assert!(page_index.offset_index(0, 0).is_some());
         assert!(page_index.column_index(0, 1).is_some());
         assert!(page_index.offset_index(0, 1).is_some());
+    }
+
+    #[test]
+    fn test_page_index_builder_reuses_shared_index() {
+        let mut col_idx_builder = ColumnIndexBuilder::new(Type::INT32);
+        col_idx_builder.append(false, vec![1, 0, 0, 0], vec![100, 0, 0, 0], 10, None);
+        let col_idx = Arc::new(col_idx_builder.build().unwrap());
+
+        let mut builder = PageIndexBuilder::new(1, 1);
+        builder.put_column_index_shared(Arc::clone(&col_idx), 0, 0);
+        // Preserve the existing behavior of ignoring coordinates outside the declared shape.
+        builder.put_column_index_shared(Arc::clone(&col_idx), 1, 0);
+        let page_index = builder.build();
+
+        assert!(std::ptr::eq(
+            page_index.column_index(0, 0).unwrap(),
+            Arc::as_ref(&col_idx)
+        ));
+        assert!(page_index.column_index(1, 0).is_none());
     }
 }
