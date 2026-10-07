@@ -363,10 +363,20 @@ impl RowGroupPageIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PageIndexKey {
-    row_group_idx: usize,
-    column_idx: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PageIndexKey(usize);
+
+impl PageIndexKey {
+    fn new(row_group_idx: usize, column_idx: usize, num_columns: usize) -> Option<Self> {
+        row_group_idx
+            .checked_mul(num_columns)?
+            .checked_add(column_idx)
+            .map(Self)
+    }
+
+    fn coordinates(self, num_columns: usize) -> (usize, usize) {
+        (self.0 / num_columns, self.0 % num_columns)
+    }
 }
 
 impl HeapSize for PageIndexKey {
@@ -399,13 +409,9 @@ impl<T> PageIndexMap<T> {
         for (row_group_idx, columns) in rows.into_iter().enumerate() {
             for (column_idx, value) in columns.into_iter().enumerate() {
                 if let Some(value) = value {
-                    entries.insert(
-                        PageIndexKey {
-                            row_group_idx,
-                            column_idx,
-                        },
-                        Arc::new(value),
-                    );
+                    let key = PageIndexKey::new(row_group_idx, column_idx, num_columns)
+                        .expect("row-major page index coordinate overflow");
+                    entries.insert(key, Arc::new(value));
                 }
             }
         }
@@ -417,32 +423,30 @@ impl<T> PageIndexMap<T> {
         }
     }
 
-    fn get(&self, row_group_idx: usize, column_idx: usize) -> Option<&T> {
-        self.entries
-            .get(&PageIndexKey {
-                row_group_idx,
-                column_idx,
-            })
-            .map(Arc::as_ref)
-    }
-
     fn insert(&mut self, row_group_idx: usize, column_idx: usize, value: Arc<T>) -> bool {
         if row_group_idx >= self.num_row_groups || column_idx >= self.num_columns {
             return false;
         }
 
-        self.entries.insert(
-            PageIndexKey {
-                row_group_idx,
-                column_idx,
-            },
-            value,
-        );
+        let Some(key) = PageIndexKey::new(row_group_idx, column_idx, self.num_columns) else {
+            return false;
+        };
+        self.entries.insert(key, value);
         true
     }
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    fn freeze(self) -> PageIndexEntries<T> {
+        let mut entries: Vec<_> = self.entries.into_iter().collect();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        PageIndexEntries {
+            num_row_groups: self.num_row_groups,
+            num_columns: self.num_columns,
+            entries: entries.into_boxed_slice(),
+        }
     }
 }
 
@@ -452,13 +456,54 @@ impl<T: HeapSize> HeapSize for PageIndexMap<T> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PageIndexEntries<T> {
+    num_row_groups: usize,
+    num_columns: usize,
+    entries: Box<[(PageIndexKey, Arc<T>)]>,
+}
+
+impl<T> PageIndexEntries<T> {
+    fn get(&self, row_group_idx: usize, column_idx: usize) -> Option<&T> {
+        if row_group_idx >= self.num_row_groups || column_idx >= self.num_columns {
+            return None;
+        }
+
+        let key = PageIndexKey::new(row_group_idx, column_idx, self.num_columns)?;
+        let entry_idx = self
+            .entries
+            .binary_search_by_key(&key, |(entry_key, _)| *entry_key)
+            .ok()?;
+        Some(self.entries[entry_idx].1.as_ref())
+    }
+
+    fn into_map(self) -> PageIndexMap<T> {
+        PageIndexMap {
+            num_row_groups: self.num_row_groups,
+            num_columns: self.num_columns,
+            entries: self.entries.into_vec().into_iter().collect(),
+        }
+    }
+}
+
+impl<T: HeapSize> HeapSize for PageIndexEntries<T> {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of_val(self.entries.as_ref())
+            + self
+                .entries
+                .iter()
+                .map(|(_, value)| value.heap_size())
+                .sum::<usize>()
+    }
+}
+
 /// Struct to encapsulate the Parquet [Page Index]
 ///
-/// This struct provides a sparse representation of the Page Index, keyed by row group and
-/// column index. Index values are reference counted so a `PageIndex` can be assembled cheaply
-/// from entries held in a shared cache. It is used internally by this crate when assembling and
-/// writing the Page Index, and is the default implementation of the [`PageIndexProvider`]
-/// contained in the [`ParquetMetaData`].
+/// This struct provides a sparse, immutable representation of the Page Index, stored in row-major
+/// order and keyed by row group and column index. Index values are reference counted so a
+/// `PageIndex` can be assembled cheaply from entries held in a shared cache. It is used internally
+/// by this crate when assembling and writing the Page Index, and is the default implementation of
+/// the [`PageIndexProvider`] contained in the [`ParquetMetaData`].
 ///
 /// # Example: Constructing a synthetic `PageIndex`
 ///
@@ -531,8 +576,8 @@ impl<T: HeapSize> HeapSize for PageIndexMap<T> {
 /// [`ParquetMetaData`]: crate::file::metadata::ParquetMetaData
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageIndex {
-    column_indexes: Option<PageIndexMap<ColumnIndexMetaData>>,
-    offset_indexes: Option<PageIndexMap<OffsetIndexMetaData>>,
+    column_indexes: Option<PageIndexEntries<ColumnIndexMetaData>>,
+    offset_indexes: Option<PageIndexEntries<OffsetIndexMetaData>>,
 }
 
 impl PageIndex {
@@ -541,8 +586,8 @@ impl PageIndex {
         offset_indexes: Option<Vec<Vec<Option<OffsetIndexMetaData>>>>,
     ) -> Self {
         Self {
-            column_indexes: column_indexes.map(PageIndexMap::from_rows),
-            offset_indexes: offset_indexes.map(PageIndexMap::from_rows),
+            column_indexes: column_indexes.map(|rows| PageIndexMap::from_rows(rows).freeze()),
+            offset_indexes: offset_indexes.map(|rows| PageIndexMap::from_rows(rows).freeze()),
         }
     }
 
@@ -555,7 +600,7 @@ impl PageIndex {
     ///
     /// Each entry contains its `(row_group_index, column_index)` coordinate and the shared index
     /// metadata. This can be used to transfer parsed indexes into a cache without cloning the
-    /// metadata or allocating new [`Arc`]s. Entry order is unspecified.
+    /// metadata or allocating new [`Arc`]s. Entries are returned in row-major order.
     #[expect(clippy::type_complexity)]
     pub fn into_index_entries(
         self,
@@ -563,18 +608,20 @@ impl PageIndex {
         impl Iterator<Item = ((usize, usize), Arc<ColumnIndexMetaData>)>,
         impl Iterator<Item = ((usize, usize), Arc<OffsetIndexMetaData>)>,
     ) {
-        let column_indexes = self
+        let (column_count, column_indexes) = self
             .column_indexes
-            .map(|indexes| indexes.entries)
-            .unwrap_or_default()
+            .map(|indexes| (indexes.num_columns, indexes.entries.into_vec()))
+            .unwrap_or_default();
+        let column_indexes = column_indexes
             .into_iter()
-            .map(|(key, index)| ((key.row_group_idx, key.column_idx), index));
-        let offset_indexes = self
+            .map(move |(key, index)| (key.coordinates(column_count), index));
+        let (column_count, offset_indexes) = self
             .offset_indexes
-            .map(|indexes| indexes.entries)
-            .unwrap_or_default()
+            .map(|indexes| (indexes.num_columns, indexes.entries.into_vec()))
+            .unwrap_or_default();
+        let offset_indexes = offset_indexes
             .into_iter()
-            .map(|(key, index)| ((key.row_group_idx, key.column_idx), index));
+            .map(move |(key, index)| (key.coordinates(column_count), index));
 
         (column_indexes, offset_indexes)
     }
@@ -647,8 +694,8 @@ impl PageIndexBuilder {
     /// allowing them to be modified and rebuilt. Useful for updating existing page indexes.
     pub(crate) fn new_from(page_index: PageIndex) -> Self {
         Self {
-            column_indexes: page_index.column_indexes,
-            offset_indexes: page_index.offset_indexes,
+            column_indexes: page_index.column_indexes.map(PageIndexEntries::into_map),
+            offset_indexes: page_index.offset_indexes.map(PageIndexEntries::into_map),
         }
     }
 
@@ -758,8 +805,8 @@ impl PageIndexBuilder {
         };
 
         PageIndex {
-            column_indexes,
-            offset_indexes,
+            column_indexes: column_indexes.map(PageIndexMap::freeze),
+            offset_indexes: offset_indexes.map(PageIndexMap::freeze),
         }
     }
 }
