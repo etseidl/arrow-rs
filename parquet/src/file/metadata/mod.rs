@@ -2319,5 +2319,12 @@ mod tests {
             Arc::as_ref(&col_idx)
         ));
         assert!(page_index.column_index(1, 0).is_none());
+
+        let (mut column_indexes, mut offset_indexes) = page_index.into_index_entries();
+        let (coordinate, extracted) = column_indexes.next().unwrap();
+        assert_eq!(coordinate, (0, 0));
+        assert!(Arc::ptr_eq(&extracted, &col_idx));
+        assert!(column_indexes.next().is_none());
+        assert!(offset_indexes.next().is_none());
     }
 }

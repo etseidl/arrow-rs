@@ -550,6 +550,33 @@ impl PageIndex {
     pub fn into_builder(self) -> PageIndexBuilder {
         self.into()
     }
+
+    /// Consumes this page index and returns its populated column and offset index entries.
+    ///
+    /// Each entry contains its `(row_group_index, column_index)` coordinate and the shared index
+    /// metadata. This can be used to transfer parsed indexes into a cache without cloning the
+    /// metadata or allocating new [`Arc`]s. Entry order is unspecified.
+    pub fn into_index_entries(
+        self,
+    ) -> (
+        impl Iterator<Item = ((usize, usize), Arc<ColumnIndexMetaData>)>,
+        impl Iterator<Item = ((usize, usize), Arc<OffsetIndexMetaData>)>,
+    ) {
+        let column_indexes = self
+            .column_indexes
+            .map(|indexes| indexes.entries)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, index)| ((key.row_group_idx, key.column_idx), index));
+        let offset_indexes = self
+            .offset_indexes
+            .map(|indexes| indexes.entries)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, index)| ((key.row_group_idx, key.column_idx), index));
+
+        (column_indexes, offset_indexes)
+    }
 }
 
 impl PageIndexProvider for PageIndex {
