@@ -124,6 +124,7 @@ use crate::parquet_thrift::{
 use crate::thrift_struct;
 use bytes::Bytes;
 use std::io::Write;
+use std::ops::Range;
 use twox_hash::XxHash64;
 
 /// Salt as defined in the [spec](https://github.com/apache/parquet-format/blob/master/BloomFilter.md#technical-approach).
@@ -170,7 +171,7 @@ pub struct BloomFilterHeader {
 /// When a value is inserted, [`Block::mask`] picks one bit in each word
 /// (8 bits total), and those bits are OR'd in. When checking, we verify
 /// all 8 bits are set.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 struct Block([u32; 8]);
 impl Block {
@@ -317,10 +318,273 @@ impl Block {
 ///
 /// The creation of this structure is based on the [`crate::file::properties::BloomFilterProperties`]
 /// struct set via [`crate::file::properties::WriterProperties`] and is thus hidden by default.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sbbf(Vec<Block>);
 
 pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
+
+/// Information needed to read a Bloom filter from a file.
+///
+/// This struct is returned by [`decode_bloom_filter_header`] and contains
+/// all the validated offsets and ranges needed to read the filter's bitset.
+#[derive(Debug, Clone)]
+pub(crate) struct BloomFilterReadInfo {
+    /// The file offset where the Bloom filter starts (including header)
+    pub(crate) filter_offset: u64,
+    /// Length of the parsed header in bytes
+    pub(crate) header_len: u64,
+    /// Byte range in the file where the bitset data is located
+    pub(crate) bitset_range: Range<u64>,
+    /// Total length of the filter (header + bitset) in bytes
+    pub(crate) total_len: u64,
+}
+
+/// Decode and validate a Bloom filter header.
+///
+/// This function parses the Thrift-encoded header, validates its contents,
+/// and returns information needed to read the bitset.
+///
+/// # Arguments
+/// * `filter_offset` - File offset where the Bloom filter starts
+/// * `header_bytes` - Buffer containing at least the header (may contain more)
+/// * `advertised_total_len` - Optional total length from column metadata's `bloom_filter_length`
+///
+/// # Validation
+/// This function validates:
+/// - The header can be successfully decoded
+/// - Algorithm is `BLOCK`, compression is `UNCOMPRESSED`, hash is `XXHASH`
+/// - `num_bytes` is non-negative and fits in `usize`
+/// - Bitset length meets requirements (size, alignment, power-of-two)
+/// - If `advertised_total_len` is provided, it matches `header_len + num_bytes`
+/// - All offset arithmetic is checked for overflow
+///
+/// # Errors
+/// Returns an error if any validation fails or arithmetic overflows.
+pub(crate) fn decode_bloom_filter_header(
+    filter_offset: u64,
+    header_bytes: Bytes,
+    advertised_total_len: Option<usize>,
+) -> Result<BloomFilterReadInfo, ParquetError> {
+    // Parse the header
+    let (header, header_len) = read_bloom_filter_header_and_length(header_bytes)?;
+
+    // Validate algorithm, compression, and hash
+    match header.algorithm {
+        BloomFilterAlgorithm::BLOCK => {
+            // Currently the only supported algorithm
+        }
+    }
+    match header.compression {
+        BloomFilterCompression::UNCOMPRESSED => {
+            // Currently the only supported compression
+        }
+    }
+    match header.hash {
+        BloomFilterHash::XXHASH => {
+            // Currently the only supported hash
+        }
+    }
+
+    // Validate and convert num_bytes
+    let num_bytes: usize = header
+        .num_bytes
+        .try_into()
+        .map_err(|_| {
+            ParquetError::General(format!(
+                "Bloom filter num_bytes is negative or too large: {}",
+                header.num_bytes
+            ))
+        })?;
+
+    // Validate bitset length through try_from_bitset requirements
+    // This checks: min/max size, multiple of 32, power of two
+    if num_bytes < BITSET_MIN_LENGTH {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset too small: {} bytes (minimum: {})",
+            num_bytes, BITSET_MIN_LENGTH
+        )));
+    }
+    if num_bytes > BITSET_MAX_LENGTH {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset too large: {} bytes (maximum: {})",
+            num_bytes, BITSET_MAX_LENGTH
+        )));
+    }
+    if num_bytes % size_of::<Block>() != 0 {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset length {} is not a multiple of block size ({})",
+            num_bytes,
+            size_of::<Block>()
+        )));
+    }
+    if !num_bytes.is_power_of_two() {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset length {} is not a power of two",
+            num_bytes
+        )));
+    }
+
+    // Convert num_bytes to u64 for arithmetic
+    let num_bytes_u64 = u64::try_from(num_bytes)
+        .map_err(|_| {
+            ParquetError::General(format!(
+                "Bloom filter bitset length too large: {}",
+                num_bytes
+            ))
+        })?;
+
+    // Calculate total length using checked arithmetic (both are u64 now)
+    let total_len = header_len
+        .checked_add(num_bytes_u64)
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter total length overflow: header_len {} + num_bytes {}",
+                header_len, num_bytes
+            ))
+        })?;
+
+    // If advertised total length is provided, validate it matches
+    if let Some(advertised) = advertised_total_len {
+        // Convert advertised to u64 for comparison
+        let advertised_u64 = u64::try_from(advertised)
+            .map_err(|_| {
+                ParquetError::General(format!(
+                    "Advertised bloom filter length too large: {}",
+                    advertised
+                ))
+            })?;
+
+        if advertised_u64 != total_len {
+            return Err(ParquetError::General(format!(
+                "Bloom filter length mismatch: advertised {} bytes, but header indicates {} bytes",
+                advertised, total_len
+            )));
+        }
+    }
+
+    // Calculate bitset range using checked arithmetic
+    let bitset_start = filter_offset
+        .checked_add(header_len)
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter bitset offset overflow: filter_offset {} + header_len {}",
+                filter_offset, header_len
+            ))
+        })?;
+
+    let bitset_end = bitset_start
+        .checked_add(num_bytes_u64)
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter bitset end overflow: bitset_start {} + num_bytes {}",
+                bitset_start, num_bytes
+            ))
+        })?;
+
+    Ok(BloomFilterReadInfo {
+        filter_offset,
+        header_len,
+        bitset_range: bitset_start..bitset_end,
+        total_len,
+    })
+}
+
+/// Decode a Bloom filter bitset from validated bytes.
+///
+/// This function constructs an [`Sbbf`] from the bitset bytes after the header
+/// has been validated by [`decode_bloom_filter_header`].
+///
+/// # Arguments
+/// * `info` - Validated header information
+/// * `bitset` - The exact bitset bytes (must match expected length)
+///
+/// # Errors
+/// Returns an error if:
+/// - The bitset length doesn't match the expected length from `info`
+/// - The bitset fails validation in [`Sbbf::try_from_bitset`]
+pub(crate) fn decode_bloom_filter_bitset(
+    info: &BloomFilterReadInfo,
+    bitset: &[u8],
+) -> Result<Sbbf, ParquetError> {
+    let expected_len = (info.bitset_range.end - info.bitset_range.start) as usize;
+
+    if bitset.len() != expected_len {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset length mismatch: expected {} bytes, got {}",
+            expected_len,
+            bitset.len()
+        )));
+    }
+
+    Sbbf::try_from_bitset(bitset)
+}
+
+/// Extract and validate Bloom filter location from column chunk metadata.
+///
+/// Returns `Ok(None)` if the column chunk has no Bloom filter (no offset in metadata).
+/// Returns `Ok(Some((offset, total_length)))` with validated offset and optional total length.
+///
+/// # Validation
+/// - Rejects negative offsets
+/// - Rejects negative `bloom_filter_length`
+/// - Validates `offset + length` doesn't overflow when length is present
+///
+/// # Errors
+/// Returns an error if any validation fails.
+pub(crate) fn bloom_filter_location(
+    column: &ColumnChunkMetaData,
+) -> Result<Option<(u64, Option<usize>)>, ParquetError> {
+    // Check if bloom filter exists
+    let offset_i64 = match column.bloom_filter_offset() {
+        Some(offset) => offset,
+        None => return Ok(None),
+    };
+
+    // Validate and convert offset
+    let offset = u64::try_from(offset_i64)
+        .map_err(|_| {
+            ParquetError::General(format!(
+                "Bloom filter offset is negative or invalid: {}",
+                offset_i64
+            ))
+        })?;
+
+    // Check if total length is provided
+    let total_length = match column.bloom_filter_length() {
+        Some(length_i32) => {
+            // Validate and convert length
+            let length = usize::try_from(length_i32)
+                .map_err(|_| {
+                    ParquetError::General(format!(
+                        "Bloom filter length is negative or invalid: {}",
+                        length_i32
+                    ))
+                })?;
+
+            // Validate offset + length doesn't overflow
+            let length_u64 = u64::try_from(length)
+                .map_err(|_| {
+                    ParquetError::General(format!(
+                        "Bloom filter length too large: {}",
+                        length
+                    ))
+                })?;
+
+            offset.checked_add(length_u64)
+                .ok_or_else(|| {
+                    ParquetError::General(format!(
+                        "Bloom filter range overflow: offset {} + length {}",
+                        offset, length
+                    ))
+                })?;
+
+            Some(length)
+        }
+        None => None,
+    };
+
+    Ok(Some((offset, total_length)))
+}
 
 /// given an initial offset, and a byte buffer, try to read out a bloom filter header and return
 /// both the header and the offset after it (for bitset).
@@ -415,6 +679,106 @@ impl Sbbf {
             })
             .collect::<Vec<Block>>();
         Self(data)
+    }
+
+    /// Creates a new [Sbbf] from a bitset with validation suitable for file data.
+    ///
+    /// This method validates that the bitset meets requirements from the
+    /// [Parquet Bloom Filter specification]:
+    ///
+    /// - Length is at least [`BITSET_MIN_LENGTH`] (32 bytes)
+    /// - Length is at most [`BITSET_MAX_LENGTH`] (128 MiB)
+    /// - Length is a multiple of 32 bytes (one [`Block`])
+    /// - Length is a power of two (per the [specification §4.1])
+    ///
+    /// Unlike [`Self::new`], this method does not silently discard trailing bytes
+    /// that don't form a complete block. All bytes must be consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bitset does not meet the validation requirements.
+    ///
+    /// # Example
+    /// ```
+    /// # use parquet::bloom_filter::Sbbf;
+    /// // Valid 32-byte bitset
+    /// let bitset = vec![0u8; 32];
+    /// let filter = Sbbf::try_from_bitset(&bitset).unwrap();
+    ///
+    /// // Invalid: too small
+    /// let bitset = vec![0u8; 16];
+    /// assert!(Sbbf::try_from_bitset(&bitset).is_err());
+    ///
+    /// // Invalid: not a multiple of 32
+    /// let bitset = vec![0u8; 33];
+    /// assert!(Sbbf::try_from_bitset(&bitset).is_err());
+    /// ```
+    ///
+    /// [Parquet Bloom Filter specification]: https://github.com/apache/parquet-format/blob/master/BloomFilter.md
+    /// [specification §4.1]: https://github.com/apache/parquet-format/blob/master/BloomFilter.md#bloom-filter-data-page-format
+    pub(crate) fn try_from_bitset(bitset: &[u8]) -> Result<Self, ParquetError> {
+        let len = bitset.len();
+
+        // Validate minimum length
+        if len < BITSET_MIN_LENGTH {
+            return Err(ParquetError::General(format!(
+                "Bloom filter bitset too small: {} bytes (minimum: {})",
+                len, BITSET_MIN_LENGTH
+            )));
+        }
+
+        // Validate maximum length
+        if len > BITSET_MAX_LENGTH {
+            return Err(ParquetError::General(format!(
+                "Bloom filter bitset too large: {} bytes (maximum: {})",
+                len, BITSET_MAX_LENGTH
+            )));
+        }
+
+        // Validate multiple of block size (32 bytes)
+        if len % size_of::<Block>() != 0 {
+            return Err(ParquetError::General(format!(
+                "Bloom filter bitset length {} is not a multiple of block size ({})",
+                len,
+                size_of::<Block>()
+            )));
+        }
+
+        // Validate power of two
+        // Per Parquet Bloom Filter spec §4.1: "The length of the bitset MUST be a power of 2"
+        // See: https://github.com/apache/parquet-format/blob/master/BloomFilter.md#bloom-filter-data-page-format
+        if !len.is_power_of_two() {
+            return Err(ParquetError::General(format!(
+                "Bloom filter bitset length {} is not a power of two",
+                len
+            )));
+        }
+
+        // All validation passed - construct the SBBF
+        // Use as_chunks which ensures no bytes are discarded
+        let (chunks, remainder) = bitset.as_chunks::<32>();
+
+        // This should be impossible given our validation above, but check defensively
+        if !remainder.is_empty() {
+            return Err(ParquetError::General(format!(
+                "Internal error: {} remainder bytes after validation",
+                remainder.len()
+            )));
+        }
+
+        let data = chunks
+            .iter()
+            .map(|chunk| {
+                let mut block = Block::ZERO;
+                let (words, _remainder) = chunk.as_chunks::<4>();
+                for (i, word) in words.iter().enumerate() {
+                    block[i] = u32::from_le_bytes(*word);
+                }
+                block
+            })
+            .collect::<Vec<Block>>();
+
+        Ok(Self(data))
     }
 
     /// Write the bloom filter data (header and then bitset) to the output. This doesn't
