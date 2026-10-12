@@ -368,8 +368,24 @@ pub(crate) fn decode_bloom_filter_header(
     header_bytes: Bytes,
     advertised_total_len: Option<usize>,
 ) -> Result<BloomFilterReadInfo, ParquetError> {
-    // Parse the header
-    let (header, header_len) = read_bloom_filter_header_and_length(header_bytes)?;
+    decode_bloom_filter_header_from_slice(
+        filter_offset,
+        header_bytes.as_ref(),
+        advertised_total_len,
+    )
+}
+
+fn decode_bloom_filter_header_from_slice(
+    filter_offset: u64,
+    header_bytes: &[u8],
+    advertised_total_len: Option<usize>,
+) -> Result<BloomFilterReadInfo, ParquetError> {
+    let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(header_bytes)
+        .map_err(|err| {
+            ParquetError::General(format!(
+                "Could not read bloom filter header at offset {filter_offset}: {err}"
+            ))
+        })?;
 
     // Validate algorithm, compression, and hash
     match header.algorithm {
@@ -389,91 +405,50 @@ pub(crate) fn decode_bloom_filter_header(
     }
 
     // Validate and convert num_bytes
-    let num_bytes: usize = header
-        .num_bytes
-        .try_into()
-        .map_err(|_| {
-            ParquetError::General(format!(
-                "Bloom filter num_bytes is negative or too large: {}",
-                header.num_bytes
-            ))
-        })?;
+    let num_bytes: usize = header.num_bytes.try_into().map_err(|_| {
+        ParquetError::General(format!(
+            "Bloom filter num_bytes is negative or too large: {}",
+            header.num_bytes
+        ))
+    })?;
 
-    // Validate bitset length through try_from_bitset requirements
-    // This checks: min/max size, multiple of 32, power of two
-    if num_bytes < BITSET_MIN_LENGTH {
-        return Err(ParquetError::General(format!(
-            "Bloom filter bitset too small: {num_bytes} bytes (minimum: {BITSET_MIN_LENGTH})"
-        )));
-    }
-    if num_bytes > BITSET_MAX_LENGTH {
-        return Err(ParquetError::General(format!(
-            "Bloom filter bitset too large: {num_bytes} bytes (maximum: {BITSET_MAX_LENGTH})"
-        )));
-    }
-    if !num_bytes.is_multiple_of(size_of::<Block>()) {
-        return Err(ParquetError::General(format!(
-            "Bloom filter bitset length {} is not a multiple of block size ({})",
-            num_bytes,
-            size_of::<Block>()
-        )));
-    }
-    if !num_bytes.is_power_of_two() {
-        return Err(ParquetError::General(format!(
-            "Bloom filter bitset length {num_bytes} is not a power of two"
-        )));
-    }
+    validate_bitset_len(num_bytes)?;
 
-    // Convert num_bytes to u64 for arithmetic
-    let num_bytes_u64 = u64::try_from(num_bytes)
-        .map_err(|_| {
-            ParquetError::General(format!(
-                "Bloom filter bitset length too large: {num_bytes}"
-            ))
-        })?;
+    let num_bytes_u64 = u64::try_from(num_bytes).map_err(|_| {
+        ParquetError::General(format!("Bloom filter bitset length too large: {num_bytes}"))
+    })?;
 
-    // Calculate total length using checked arithmetic (both are u64 now)
-    let total_len = header_len
-        .checked_add(num_bytes_u64)
-        .ok_or_else(|| {
-            ParquetError::General(format!(
-                "Bloom filter total length overflow: header_len {header_len} + num_bytes {num_bytes}"
-            ))
-        })?;
+    let total_len = header_len.checked_add(num_bytes_u64).ok_or_else(|| {
+        ParquetError::General(format!(
+            "Bloom filter total length overflow: header_len {header_len} + num_bytes {num_bytes}"
+        ))
+    })?;
 
-    // If advertised total length is provided, validate it matches
     if let Some(advertised) = advertised_total_len {
-        // Convert advertised to u64 for comparison
-        let advertised_u64 = u64::try_from(advertised)
-            .map_err(|_| {
-                ParquetError::General(format!(
-                    "Advertised bloom filter length too large: {advertised}"
-                ))
-            })?;
+        let advertised_u64 = u64::try_from(advertised).map_err(|_| {
+            ParquetError::General(format!(
+                "Advertised bloom filter length too large: {advertised}"
+            ))
+        })?;
 
         if advertised_u64 != total_len {
             return Err(ParquetError::General(format!(
-                "Bloom filter length mismatch: advertised {advertised} bytes, but header indicates {total_len} bytes"
+                "Bloom filter length mismatch at offset {filter_offset}: advertised {advertised} bytes, but header indicates {total_len} bytes"
             )));
         }
     }
 
-    // Calculate bitset range using checked arithmetic
-    let bitset_start = filter_offset
-        .checked_add(header_len)
-        .ok_or_else(|| {
-            ParquetError::General(format!(
-                "Bloom filter bitset offset overflow: filter_offset {filter_offset} + header_len {header_len}"
-            ))
-        })?;
+    let bitset_start = filter_offset.checked_add(header_len).ok_or_else(|| {
+        ParquetError::General(format!(
+            "Bloom filter bitset offset overflow: filter_offset {filter_offset} + header_len {header_len}"
+        ))
+    })?;
 
-    let bitset_end = bitset_start
-        .checked_add(num_bytes_u64)
-        .ok_or_else(|| {
-            ParquetError::General(format!(
-                "Bloom filter bitset end overflow: bitset_start {bitset_start} + num_bytes {num_bytes}"
-            ))
-        })?;
+    let bitset_end = bitset_start.checked_add(num_bytes_u64).ok_or_else(|| {
+        ParquetError::General(format!(
+            "Bloom filter bitset end overflow: bitset_start {bitset_start} + num_bytes {num_bytes}"
+        ))
+    })?;
 
     Ok(BloomFilterReadInfo {
         filter_offset,
@@ -481,6 +456,32 @@ pub(crate) fn decode_bloom_filter_header(
         bitset_range: bitset_start..bitset_end,
         total_len,
     })
+}
+
+fn validate_bitset_len(len: usize) -> Result<(), ParquetError> {
+    if len < BITSET_MIN_LENGTH {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset too small: {len} bytes (minimum: {BITSET_MIN_LENGTH})"
+        )));
+    }
+    if len > BITSET_MAX_LENGTH {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset too large: {len} bytes (maximum: {BITSET_MAX_LENGTH})"
+        )));
+    }
+    if !len.is_multiple_of(size_of::<Block>()) {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset length {} is not a multiple of block size ({})",
+            len,
+            size_of::<Block>()
+        )));
+    }
+    if !len.is_power_of_two() {
+        return Err(ParquetError::General(format!(
+            "Bloom filter bitset length {len} is not a power of two"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a Bloom filter bitset from validated bytes.
@@ -500,7 +501,17 @@ pub(crate) fn decode_bloom_filter_bitset(
     info: &BloomFilterReadInfo,
     bitset: &[u8],
 ) -> Result<Sbbf, ParquetError> {
-    let expected_len = (info.bitset_range.end - info.bitset_range.start) as usize;
+    let expected_len = info
+        .bitset_range
+        .end
+        .checked_sub(info.bitset_range.start)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Invalid bloom filter bitset range: {:?}",
+                info.bitset_range
+            ))
+        })?;
 
     if bitset.len() != expected_len {
         return Err(ParquetError::General(format!(
@@ -533,38 +544,32 @@ pub(crate) fn bloom_filter_location(
     };
 
     // Validate and convert offset
-    let offset = u64::try_from(offset_i64)
-        .map_err(|_| {
-            ParquetError::General(format!(
-                "Bloom filter offset is negative or invalid: {offset_i64}"
-            ))
-        })?;
+    let offset = u64::try_from(offset_i64).map_err(|_| {
+        ParquetError::General(format!(
+            "Bloom filter offset is negative or invalid: {offset_i64}"
+        ))
+    })?;
 
     // Check if total length is provided
     let total_length = match column.bloom_filter_length() {
         Some(length_i32) => {
             // Validate and convert length
-            let length = usize::try_from(length_i32)
-                .map_err(|_| {
-                    ParquetError::General(format!(
-                        "Bloom filter length is negative or invalid: {length_i32}"
-                    ))
-                })?;
+            let length = usize::try_from(length_i32).map_err(|_| {
+                ParquetError::General(format!(
+                    "Bloom filter length is negative or invalid: {length_i32}"
+                ))
+            })?;
 
             // Validate offset + length doesn't overflow
-            let length_u64 = u64::try_from(length)
-                .map_err(|_| {
-                    ParquetError::General(format!(
-                        "Bloom filter length too large: {length}"
-                    ))
-                })?;
+            let length_u64 = u64::try_from(length).map_err(|_| {
+                ParquetError::General(format!("Bloom filter length too large: {length}"))
+            })?;
 
-            offset.checked_add(length_u64)
-                .ok_or_else(|| {
-                    ParquetError::General(format!(
-                        "Bloom filter range overflow: offset {offset} + length {length}"
-                    ))
-                })?;
+            offset.checked_add(length_u64).ok_or_else(|| {
+                ParquetError::General(format!(
+                    "Bloom filter range overflow: offset {offset} + length {length}"
+                ))
+            })?;
 
             Some(length)
         }
@@ -572,29 +577,6 @@ pub(crate) fn bloom_filter_location(
     };
 
     Ok(Some((offset, total_length)))
-}
-
-/// given an initial offset, and a byte buffer, try to read out a bloom filter header and return
-/// both the header and the offset after it (for bitset).
-///
-/// Temporary expect for Phase 1: This function will be used in Phase 4 (batch loading)
-/// for multi-range bloom filter fetching. Remove this expect in Phase 4.
-#[expect(dead_code)]
-pub(crate) fn chunk_read_bloom_filter_header_and_offset(
-    offset: u64,
-    buffer: Bytes,
-) -> Result<(BloomFilterHeader, u64), ParquetError> {
-    let (header, length) = read_bloom_filter_header_and_length(buffer)?;
-    Ok((header, offset + length))
-}
-
-/// given a [Bytes] buffer, try to read out a bloom filter header and return both the header and
-/// length of the header.
-#[inline]
-pub(crate) fn read_bloom_filter_header_and_length(
-    buffer: Bytes,
-) -> Result<(BloomFilterHeader, u64), ParquetError> {
-    read_bloom_filter_header_and_length_from_bytes(buffer.as_ref())
 }
 
 /// Given a byte slice, try to read out a bloom filter header and return both the header and
@@ -690,82 +672,40 @@ impl Sbbf {
     ///
     /// Returns an error if the bitset does not meet the validation requirements.
     ///
-    /// # Example
-    /// ```
-    /// # use parquet::bloom_filter::Sbbf;
-    /// // Valid 32-byte bitset
-    /// let bitset = vec![0u8; 32];
-    /// let filter = Sbbf::try_from_bitset(&bitset).unwrap();
+    /// # Validation Examples
     ///
-    /// // Invalid: too small
-    /// let bitset = vec![0u8; 16];
-    /// assert!(Sbbf::try_from_bitset(&bitset).is_err());
+    /// Valid bitset sizes: 32, 64, 128, 256, 512, 1024, ... (powers of two)
     ///
-    /// // Invalid: not a multiple of 32
-    /// let bitset = vec![0u8; 33];
-    /// assert!(Sbbf::try_from_bitset(&bitset).is_err());
-    /// ```
+    /// Invalid sizes:
+    /// - 16 bytes (below minimum)
+    /// - 33 bytes (not a multiple of 32)
+    /// - 96 bytes (multiple of 32 but not a power of two)
+    ///
+    /// See unit tests `test_try_from_bitset_*` for working code examples.
     ///
     /// [Parquet Bloom Filter specification]: https://github.com/apache/parquet-format/blob/master/BloomFilter.md
     /// [specification §4.1]: https://github.com/apache/parquet-format/blob/master/BloomFilter.md#bloom-filter-data-page-format
     pub(crate) fn try_from_bitset(bitset: &[u8]) -> Result<Self, ParquetError> {
-        let len = bitset.len();
-
-        // Validate minimum length
-        if len < BITSET_MIN_LENGTH {
-            return Err(ParquetError::General(format!(
-                "Bloom filter bitset too small: {len} bytes (minimum: {BITSET_MIN_LENGTH})"
-            )));
-        }
-
-        // Validate maximum length
-        if len > BITSET_MAX_LENGTH {
-            return Err(ParquetError::General(format!(
-                "Bloom filter bitset too large: {len} bytes (maximum: {BITSET_MAX_LENGTH})"
-            )));
-        }
-
-        // Validate multiple of block size (32 bytes)
-        if !len.is_multiple_of(size_of::<Block>()) {
-            return Err(ParquetError::General(format!(
-                "Bloom filter bitset length {} is not a multiple of block size ({})",
-                len,
-                size_of::<Block>()
-            )));
-        }
-
-        // Validate power of two
-        // Per Parquet Bloom Filter spec §4.1: "The length of the bitset MUST be a power of 2"
-        // See: https://github.com/apache/parquet-format/blob/master/BloomFilter.md#bloom-filter-data-page-format
-        if !len.is_power_of_two() {
-            return Err(ParquetError::General(format!(
-                "Bloom filter bitset length {len} is not a power of two"
-            )));
-        }
-
-        // All validation passed - construct the SBBF
-        // Use as_chunks which ensures no bytes are discarded
+        validate_bitset_len(bitset.len())?;
         let (chunks, remainder) = bitset.as_chunks::<32>();
+        debug_assert!(remainder.is_empty());
 
-        // This should be impossible given our validation above, but check defensively
-        if !remainder.is_empty() {
-            return Err(ParquetError::General(format!(
-                "Internal error: {} remainder bytes after validation",
-                remainder.len()
-            )));
+        let mut data = Vec::new();
+        data.try_reserve_exact(chunks.len()).map_err(|err| {
+            ParquetError::General(format!(
+                "Could not allocate {} bloom filter blocks: {err}",
+                chunks.len()
+            ))
+        })?;
+        for chunk in chunks {
+            let mut block = Block::ZERO;
+            let (words, remainder) = chunk.as_chunks::<4>();
+            debug_assert!(remainder.is_empty());
+            for (i, word) in words.iter().enumerate() {
+                block[i] = u32::from_le_bytes(*word);
+            }
+            data.push(block);
         }
-
-        let data = chunks
-            .iter()
-            .map(|chunk| {
-                let mut block = Block::ZERO;
-                let (words, _remainder) = chunk.as_chunks::<4>();
-                for (i, word) in words.iter().enumerate() {
-                    block[i] = u32::from_le_bytes(*word);
-                }
-                block
-            })
-            .collect::<Vec<Block>>();
 
         Ok(Self(data))
     }
@@ -852,13 +792,15 @@ impl Sbbf {
         // Get the bitset bytes
         let bitset = if total_length.is_some() {
             // We already have the full filter
-            let bitset_start = usize::try_from(info.bitset_range.start - offset)
-                .map_err(|_| {
-                    ParquetError::General(format!(
-                        "Bitset offset too large: {}",
-                        info.bitset_range.start - offset
-                    ))
-                })?;
+            let relative_start = info.bitset_range.start.checked_sub(offset).ok_or_else(|| {
+                ParquetError::General(format!(
+                    "Bloom filter bitset starts before filter: {} < {offset}",
+                    info.bitset_range.start
+                ))
+            })?;
+            let bitset_start = usize::try_from(relative_start).map_err(|_| {
+                ParquetError::General(format!("Bitset offset too large: {relative_start}"))
+            })?;
             buffer.slice(bitset_start..)
         } else {
             // Need to read bitset separately
@@ -1105,29 +1047,24 @@ impl Sbbf {
     /// # }
     /// ```
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParquetError> {
-        let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(bytes)?;
-
-        let bitset_length: u64 = header
-            .num_bytes
-            .try_into()
-            .map_err(|_| ParquetError::General("Bloom filter length is invalid".to_string()))?;
-
-        // Validate that bitset consumes all remaining bytes
-        if header_len + bitset_length != bytes.len() as u64 {
-            return Err(ParquetError::General(format!(
-                "Bloom filter data contains extra bytes: expected {} total bytes, got {}",
-                header_len + bitset_length,
-                bytes.len()
-            )));
-        }
-
-        let start = header_len as usize;
-        let end = (header_len + bitset_length) as usize;
+        let info = decode_bloom_filter_header_from_slice(0, bytes, Some(bytes.len()))?;
+        let start = usize::try_from(info.bitset_range.start).map_err(|_| {
+            ParquetError::General(format!(
+                "Bloom filter bitset offset is too large: {}",
+                info.bitset_range.start
+            ))
+        })?;
+        let end = usize::try_from(info.bitset_range.end).map_err(|_| {
+            ParquetError::General(format!(
+                "Bloom filter bitset end is too large: {}",
+                info.bitset_range.end
+            ))
+        })?;
         let bitset = bytes
             .get(start..end)
             .ok_or_else(|| ParquetError::General("Bloom filter bitset is invalid".to_string()))?;
 
-        Ok(Self::new(bitset))
+        decode_bloom_filter_bitset(&info, bitset)
     }
 }
 
@@ -1143,6 +1080,41 @@ fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn encode_bloom_filter(num_bytes: i32, bitset_len: usize) -> Vec<u8> {
+        let header = BloomFilterHeader {
+            num_bytes,
+            algorithm: BloomFilterAlgorithm::BLOCK,
+            hash: BloomFilterHash::XXHASH,
+            compression: BloomFilterCompression::UNCOMPRESSED,
+        };
+        let mut bytes = Vec::new();
+        header
+            .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut bytes))
+            .unwrap();
+        bytes.resize(bytes.len() + bitset_len, 0);
+        bytes
+    }
+
+    fn bloom_filter_column(offset: Option<i64>, length: Option<i32>) -> ColumnChunkMetaData {
+        use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+        let column_descriptor = Arc::new(ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
+            ),
+            0,
+            0,
+            ColumnPath::new(vec!["test".to_string()]),
+        ));
+        ColumnChunkMetaData::builder(column_descriptor)
+            .set_bloom_filter_offset(offset)
+            .set_bloom_filter_length(length)
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn test_hash_bytes() {
@@ -1206,7 +1178,7 @@ mod tests {
                 num_bytes,
             },
             read_length,
-        ) = read_bloom_filter_header_and_length(Bytes::copy_from_slice(buffer)).unwrap();
+        ) = read_bloom_filter_header_and_length_from_bytes(buffer).unwrap();
         assert_eq!(read_length, 15);
         assert_eq!(algorithm, BloomFilterAlgorithm::BLOCK);
         assert_eq!(compression, BloomFilterCompression::UNCOMPRESSED);
@@ -1695,22 +1667,13 @@ mod tests {
         let bitset = vec![0u8; 16];
         let result = Sbbf::try_from_bitset(&bitset);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("too small"));
+        assert!(result.unwrap_err().to_string().contains("too small"));
     }
 
     #[test]
-    fn test_try_from_bitset_too_large() {
-        // Above maximum (128 MiB + 1)
-        // Don't actually allocate that much memory, just test the validation
-        // We'll construct a smaller test that validates the check exists
-        let bitset = vec![0u8; 32]; // Valid size
-        let result = Sbbf::try_from_bitset(&bitset);
-        assert!(result.is_ok());
-
-        // The actual max validation can't be tested without OOM, but we validated the code path
+    fn test_validate_bitset_too_large() {
+        let error = validate_bitset_len(BITSET_MAX_LENGTH + 1).unwrap_err();
+        assert!(error.to_string().contains("too large"));
     }
 
     #[test]
@@ -1719,10 +1682,7 @@ mod tests {
         let bitset = vec![0u8; 33];
         let result = Sbbf::try_from_bitset(&bitset);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not a multiple"));
+        assert!(result.unwrap_err().to_string().contains("not a multiple"));
     }
 
     #[test]
@@ -1731,10 +1691,12 @@ mod tests {
         let bitset = vec![0u8; 96];
         let result = Sbbf::try_from_bitset(&bitset);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not a power of two"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a power of two")
+        );
     }
 
     #[test]
@@ -1781,10 +1743,7 @@ mod tests {
             Some(header_bytes.len() + 64), // Wrong: should be +32
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("length mismatch"));
+        assert!(result.unwrap_err().to_string().contains("length mismatch"));
     }
 
     #[test]
@@ -1802,10 +1761,7 @@ mod tests {
 
         let result = decode_bloom_filter_header(100, Bytes::from(header_bytes), None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("negative"));
+        assert!(result.unwrap_err().to_string().contains("negative"));
     }
 
     #[test]
@@ -1823,10 +1779,7 @@ mod tests {
 
         let result = decode_bloom_filter_header(100, Bytes::from(header_bytes), None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("too small"));
+        assert!(result.unwrap_err().to_string().contains("too small"));
     }
 
     #[test]
@@ -1844,10 +1797,12 @@ mod tests {
 
         let result = decode_bloom_filter_header(100, Bytes::from(header_bytes), None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not a power of two"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a power of two")
+        );
     }
 
     #[test]
@@ -1864,10 +1819,7 @@ mod tests {
         let bitset = vec![0u8; 64]; // Wrong: should be 32
         let result = decode_bloom_filter_bitset(&info, &bitset);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("length mismatch"));
+        assert!(result.unwrap_err().to_string().contains("length mismatch"));
     }
 
     #[test]
@@ -1876,18 +1828,16 @@ mod tests {
         use crate::schema::types::Type;
 
         // Create column metadata without bloom filter
-        let col_desc = Arc::new(
-            crate::schema::types::ColumnDescriptor::new(
-                Arc::new(
-                    Type::primitive_type_builder("test", crate::basic::Type::INT32)
-                        .build()
-                        .unwrap(),
-                ),
-                0,
-                0,
-                crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        let col_desc = Arc::new(crate::schema::types::ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
             ),
-        );
+            0,
+            0,
+            crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        ));
         let column = ColumnChunkMetaData::builder(col_desc).build().unwrap();
 
         let result = bloom_filter_location(&column);
@@ -1900,18 +1850,16 @@ mod tests {
         use crate::file::metadata::ColumnChunkMetaData;
         use crate::schema::types::Type;
 
-        let col_desc = Arc::new(
-            crate::schema::types::ColumnDescriptor::new(
-                Arc::new(
-                    Type::primitive_type_builder("test", crate::basic::Type::INT32)
-                        .build()
-                        .unwrap(),
-                ),
-                0,
-                0,
-                crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        let col_desc = Arc::new(crate::schema::types::ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
             ),
-        );
+            0,
+            0,
+            crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        ));
         let column = ColumnChunkMetaData::builder(col_desc)
             .set_bloom_filter_offset(Some(-1))
             .build()
@@ -1919,10 +1867,7 @@ mod tests {
 
         let result = bloom_filter_location(&column);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("negative"));
+        assert!(result.unwrap_err().to_string().contains("negative"));
     }
 
     #[test]
@@ -1930,18 +1875,16 @@ mod tests {
         use crate::file::metadata::ColumnChunkMetaData;
         use crate::schema::types::Type;
 
-        let col_desc = Arc::new(
-            crate::schema::types::ColumnDescriptor::new(
-                Arc::new(
-                    Type::primitive_type_builder("test", crate::basic::Type::INT32)
-                        .build()
-                        .unwrap(),
-                ),
-                0,
-                0,
-                crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        let col_desc = Arc::new(crate::schema::types::ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
             ),
-        );
+            0,
+            0,
+            crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        ));
         let column = ColumnChunkMetaData::builder(col_desc)
             .set_bloom_filter_offset(Some(100))
             .set_bloom_filter_length(Some(-1))
@@ -1950,10 +1893,7 @@ mod tests {
 
         let result = bloom_filter_location(&column);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("negative"));
+        assert!(result.unwrap_err().to_string().contains("negative"));
     }
 
     #[test]
@@ -1961,18 +1901,16 @@ mod tests {
         use crate::file::metadata::ColumnChunkMetaData;
         use crate::schema::types::Type;
 
-        let col_desc = Arc::new(
-            crate::schema::types::ColumnDescriptor::new(
-                Arc::new(
-                    Type::primitive_type_builder("test", crate::basic::Type::INT32)
-                        .build()
-                        .unwrap(),
-                ),
-                0,
-                0,
-                crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        let col_desc = Arc::new(crate::schema::types::ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
             ),
-        );
+            0,
+            0,
+            crate::schema::types::ColumnPath::new(vec!["test".to_string()]),
+        ));
         // Note: In practice, overflow is very unlikely because:
         // - Offset comes from i64::MAX at most
         // - Length comes from i32::MAX at most
@@ -1987,6 +1925,107 @@ mod tests {
         let result = bloom_filter_location(&column);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_decode_bloom_filter_header_offset_overflow() {
+        let bytes = encode_bloom_filter(32, 0);
+        let error = decode_bloom_filter_header(u64::MAX, Bytes::from(bytes), None).unwrap_err();
+        assert!(error.to_string().contains("offset overflow"));
+    }
+
+    #[test]
+    fn test_decode_bloom_filter_header_truncated() {
+        let bytes = encode_bloom_filter(32, 0);
+        let truncated = Bytes::copy_from_slice(&bytes[..bytes.len() - 1]);
+        let error = decode_bloom_filter_header(123, truncated, None).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("offset 123"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_decode_bloom_filter_bitset_rejects_short_and_long_input() {
+        let bytes = encode_bloom_filter(32, 0);
+        let info = decode_bloom_filter_header(100, Bytes::from(bytes), None).unwrap();
+
+        for bitset_len in [31, 33] {
+            let error = decode_bloom_filter_bitset(&info, &vec![0; bitset_len]).unwrap_err();
+            assert!(error.to_string().contains("length mismatch"));
+        }
+    }
+
+    #[test]
+    fn test_decode_bloom_filter_bitset_rejects_invalid_range() {
+        let valid_range = 110..142;
+        let info = BloomFilterReadInfo {
+            filter_offset: 100,
+            header_len: 10,
+            bitset_range: valid_range.end..valid_range.start,
+            total_len: 42,
+        };
+        let error = decode_bloom_filter_bitset(&info, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid bloom filter bitset range")
+        );
+    }
+
+    #[test]
+    fn test_from_bytes_uses_validated_decoder() {
+        for num_bytes in [16, 33, 96] {
+            let bytes = encode_bloom_filter(num_bytes, num_bytes as usize);
+            assert!(
+                Sbbf::from_bytes(&bytes).is_err(),
+                "accepted invalid bitset length {num_bytes}"
+            );
+        }
+
+        for actual_len in [31, 33] {
+            let bytes = encode_bloom_filter(32, actual_len);
+            assert!(
+                Sbbf::from_bytes(&bytes).is_err(),
+                "accepted {actual_len} bytes for a 32-byte bitset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_from_column_chunk_known_and_unknown_length() {
+        let bytes = Bytes::from(encode_bloom_filter(32, 32));
+        let total_len = i32::try_from(bytes.len()).unwrap();
+
+        for length in [Some(total_len), None] {
+            let column = bloom_filter_column(Some(0), length);
+            let filter = Sbbf::read_from_column_chunk(&column, &bytes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(filter, Sbbf::try_from_bitset(&[0; 32]).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_read_from_column_chunk_rejects_truncated_bitset() {
+        let bytes = Bytes::from(encode_bloom_filter(32, 31));
+
+        let known_length = bloom_filter_column(Some(0), Some(i32::try_from(bytes.len()).unwrap()));
+        assert!(Sbbf::read_from_column_chunk(&known_length, &bytes).is_err());
+
+        let unknown_length = bloom_filter_column(Some(0), None);
+        assert!(Sbbf::read_from_column_chunk(&unknown_length, &bytes).is_err());
+    }
+
+    #[test]
+    fn test_read_from_column_chunk_without_offset() {
+        let column = bloom_filter_column(None, None);
+        assert!(
+            Sbbf::read_from_column_chunk(&column, &Bytes::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

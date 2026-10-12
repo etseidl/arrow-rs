@@ -15,13 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::malformed_bloom_filter_header;
 use crate::io::TestReader;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use parquet::{
-    arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder},
+    arrow::{
+        ArrowWriter, ParquetRecordBatchStreamBuilder, arrow_reader::ParquetRecordBatchReaderBuilder,
+    },
     file::properties::WriterProperties,
 };
+
+#[tokio::test]
+async fn test_malformed_filter_error_matches_sync_reader() {
+    let (data, metadata) = malformed_bloom_filter_header();
+
+    let sync_builder =
+        ParquetRecordBatchReaderBuilder::new_with_metadata(data.clone(), metadata.clone());
+    let sync_error = sync_builder
+        .get_row_group_column_bloom_filter(0, 0)
+        .unwrap_err()
+        .to_string();
+
+    let mut async_builder =
+        ParquetRecordBatchStreamBuilder::new_with_metadata(TestReader::new(data), metadata);
+    let async_error = async_builder
+        .get_row_group_column_bloom_filter(0, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        sync_error.contains("negative"),
+        "unexpected error: {sync_error}"
+    );
+    assert_eq!(async_error, sync_error);
+}
 
 #[tokio::test]
 async fn test_get_row_group_column_bloom_filter_without_length() {

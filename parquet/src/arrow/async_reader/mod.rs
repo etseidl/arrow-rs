@@ -588,8 +588,8 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         column_idx: usize,
     ) -> Result<Option<Sbbf>> {
         use crate::bloom_filter::{
-            bloom_filter_location, decode_bloom_filter_bitset, decode_bloom_filter_header,
-            SBBF_HEADER_SIZE_ESTIMATE,
+            SBBF_HEADER_SIZE_ESTIMATE, bloom_filter_location, decode_bloom_filter_bitset,
+            decode_bloom_filter_header,
         };
 
         let metadata = self.metadata.row_group(row_group_idx);
@@ -602,20 +602,19 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
 
         // Determine how much to read initially
         let initial_read_len = match total_length {
-            Some(len) => {
-                u64::try_from(len).map_err(|_| {
-                    ParquetError::General(format!("Bloom filter length too large: {len}"))
-                })?
-            }
+            Some(len) => u64::try_from(len).map_err(|_| {
+                ParquetError::General(format!("Bloom filter length too large: {len}"))
+            })?,
             None => SBBF_HEADER_SIZE_ESTIMATE as u64,
         };
+        let initial_read_end = offset.checked_add(initial_read_len).ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter range overflow: offset {offset} + length {initial_read_len}"
+            ))
+        })?;
 
         // Async: Read header (and possibly full filter if length is known)
-        let buffer = self
-            .input
-            .0
-            .get_bytes(offset..offset + initial_read_len)
-            .await?;
+        let buffer = self.input.0.get_bytes(offset..initial_read_end).await?;
 
         // Decode and validate header using shared helper
         let info = decode_bloom_filter_header(offset, buffer.clone(), total_length)?;
@@ -623,19 +622,19 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         // Get the bitset bytes
         let bitset = if total_length.is_some() {
             // We already have the full filter
-            let bitset_start = usize::try_from(info.bitset_range.start - offset).map_err(|_| {
+            let relative_start = info.bitset_range.start.checked_sub(offset).ok_or_else(|| {
                 ParquetError::General(format!(
-                    "Bitset offset too large: {}",
-                    info.bitset_range.start - offset
+                    "Bloom filter bitset starts before filter: {} < {offset}",
+                    info.bitset_range.start
                 ))
+            })?;
+            let bitset_start = usize::try_from(relative_start).map_err(|_| {
+                ParquetError::General(format!("Bitset offset too large: {relative_start}"))
             })?;
             buffer.slice(bitset_start..)
         } else {
             // Async: Need to read bitset separately
-            self.input
-                .0
-                .get_bytes(info.bitset_range.clone())
-                .await?
+            self.input.0.get_bytes(info.bitset_range.clone()).await?
         };
 
         // Decode and validate bitset using shared helper
