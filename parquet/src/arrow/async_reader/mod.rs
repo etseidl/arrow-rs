@@ -604,7 +604,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         let initial_read_len = match total_length {
             Some(len) => {
                 u64::try_from(len).map_err(|_| {
-                    ParquetError::General(format!("Bloom filter length too large: {}", len))
+                    ParquetError::General(format!("Bloom filter length too large: {len}"))
                 })?
             }
             None => SBBF_HEADER_SIZE_ESTIMATE as u64,
