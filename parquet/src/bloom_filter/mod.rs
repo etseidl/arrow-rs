@@ -835,53 +835,56 @@ impl Sbbf {
     }
 
     /// Read a new bloom filter from the given offset in the given reader.
+    ///
+    /// Returns `Ok(None)` if the column chunk has no Bloom filter.
+    /// Returns `Err` if the Bloom filter exists but is malformed or truncated.
+    ///
+    /// This method uses validated decoding through [`decode_bloom_filter_header`]
+    /// and [`decode_bloom_filter_bitset`] to ensure all Parquet specification
+    /// requirements are met.
     pub fn read_from_column_chunk<R: ChunkReader>(
         column_metadata: &ColumnChunkMetaData,
         reader: &R,
     ) -> Result<Option<Self>, ParquetError> {
-        let offset: u64 = if let Some(offset) = column_metadata.bloom_filter_offset() {
-            offset
-                .try_into()
-                .map_err(|_| ParquetError::General("Bloom filter offset is invalid".to_string()))?
-        } else {
+        // Extract and validate location from metadata
+        let Some((offset, total_length)) = bloom_filter_location(column_metadata)? else {
             return Ok(None);
         };
 
-        let buffer = match column_metadata.bloom_filter_length() {
-            Some(length) => reader.get_bytes(offset, length as usize),
-            None => reader.get_bytes(offset, SBBF_HEADER_SIZE_ESTIMATE),
-        }?;
+        // Determine how much to read initially
+        let initial_read_len = total_length.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE);
 
-        let (header, bitset_offset) =
-            chunk_read_bloom_filter_header_and_offset(offset, buffer.clone())?;
+        // Read header (and possibly full filter if length is known)
+        let buffer = reader.get_bytes(offset, initial_read_len)?;
 
-        match header.algorithm {
-            BloomFilterAlgorithm::BLOCK => {
-                // this match exists to future proof the singleton algorithm enum
-            }
-        }
-        match header.compression {
-            BloomFilterCompression::UNCOMPRESSED => {
-                // this match exists to future proof the singleton compression enum
-            }
-        }
-        match header.hash {
-            BloomFilterHash::XXHASH => {
-                // this match exists to future proof the singleton hash enum
-            }
-        }
+        // Decode and validate header
+        let info = decode_bloom_filter_header(offset, buffer.clone(), total_length)?;
 
-        let bitset = match column_metadata.bloom_filter_length() {
-            Some(_) => buffer.slice((bitset_offset - offset) as usize..),
-            None => {
-                let bitset_length: usize = header.num_bytes.try_into().map_err(|_| {
-                    ParquetError::General("Bloom filter length is invalid".to_string())
+        // Get the bitset bytes
+        let bitset = if total_length.is_some() {
+            // We already have the full filter
+            let bitset_start = usize::try_from(info.bitset_range.start - offset)
+                .map_err(|_| {
+                    ParquetError::General(format!(
+                        "Bitset offset too large: {}",
+                        info.bitset_range.start - offset
+                    ))
                 })?;
-                reader.get_bytes(bitset_offset, bitset_length)?
-            }
+            buffer.slice(bitset_start..)
+        } else {
+            // Need to read bitset separately
+            let bitset_len = usize::try_from(info.bitset_range.end - info.bitset_range.start)
+                .map_err(|_| {
+                    ParquetError::General(format!(
+                        "Bitset length too large: {}",
+                        info.bitset_range.end - info.bitset_range.start
+                    ))
+                })?;
+            reader.get_bytes(info.bitset_range.start, bitset_len)?
         };
 
-        Ok(Some(Self::new(&bitset)))
+        // Decode and validate bitset
+        decode_bloom_filter_bitset(&info, &bitset).map(Some)
     }
 
     /// Map a 64-bit hash to a block index in `[0, num_blocks)`.
