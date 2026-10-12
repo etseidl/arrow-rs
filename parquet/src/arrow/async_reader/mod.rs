@@ -40,9 +40,9 @@ use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
 };
 
-use crate::basic::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
 use crate::bloom_filter::{
-    SBBF_HEADER_SIZE_ESTIMATE, Sbbf, chunk_read_bloom_filter_header_and_offset,
+    SBBF_HEADER_SIZE_ESTIMATE, Sbbf, bloom_filter_location, decode_bloom_filter_bitset,
+    decode_bloom_filter_header,
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -593,63 +593,41 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         let metadata = self.metadata.row_group(row_group_idx);
         let column_metadata = metadata.column(column_idx);
 
-        let offset: u64 = if let Some(offset) = column_metadata.bloom_filter_offset() {
-            offset
-                .try_into()
-                .map_err(|_| ParquetError::General("Bloom filter offset is invalid".to_string()))?
-        } else {
+        let Some((offset, total_length)) = bloom_filter_location(column_metadata)? else {
             return Ok(None);
         };
 
-        let buffer = match column_metadata.bloom_filter_length() {
-            Some(length) => self.input.0.get_bytes(offset..offset + length as u64),
-            None => self
-                .input
-                .0
-                .get_bytes(offset..offset + SBBF_HEADER_SIZE_ESTIMATE as u64),
-        }
-        .await?;
-
-        let (header, bitset_offset) =
-            chunk_read_bloom_filter_header_and_offset(offset, buffer.clone())?;
-
-        match header.algorithm {
-            BloomFilterAlgorithm::BLOCK => {
-                // this match exists to future proof the singleton algorithm enum
-            }
-        }
-        match header.compression {
-            BloomFilterCompression::UNCOMPRESSED => {
-                // this match exists to future proof the singleton compression enum
-            }
-        }
-        match header.hash {
-            BloomFilterHash::XXHASH => {
-                // this match exists to future proof the singleton hash enum
-            }
-        }
-
-        let bitset = match column_metadata.bloom_filter_length() {
-            Some(_) => {
-                let bitset_start = bitset_offset
-                    .checked_sub(offset)
-                    .and_then(|start| usize::try_from(start).ok())
-                    .ok_or_else(|| {
-                        ParquetError::General("Bloom filter offset is invalid".to_string())
-                    })?;
-                buffer.slice(bitset_start..)
-            }
-            None => {
-                let bitset_length: u64 = header.num_bytes.try_into().map_err(|_| {
-                    ParquetError::General("Bloom filter length is invalid".to_string())
-                })?;
-                self.input
-                    .0
-                    .get_bytes(bitset_offset..bitset_offset + bitset_length)
-                    .await?
-            }
+        let initial_read_len = match total_length {
+            Some(len) => u64::try_from(len).map_err(|_| {
+                ParquetError::General(format!("Bloom filter length too large: {len}"))
+            })?,
+            None => SBBF_HEADER_SIZE_ESTIMATE as u64,
         };
-        Ok(Some(Sbbf::new(&bitset)))
+        let initial_read_end = offset.checked_add(initial_read_len).ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter range overflow: offset {offset} + length {initial_read_len}"
+            ))
+        })?;
+
+        let buffer = self.input.0.get_bytes(offset..initial_read_end).await?;
+        let info = decode_bloom_filter_header(offset, &buffer, total_length)?;
+
+        let bitset = if total_length.is_some() {
+            let relative_start = info.bitset_range.start.checked_sub(offset).ok_or_else(|| {
+                ParquetError::General(format!(
+                    "Bloom filter bitset starts before filter: {} < {offset}",
+                    info.bitset_range.start
+                ))
+            })?;
+            let bitset_start = usize::try_from(relative_start).map_err(|_| {
+                ParquetError::General(format!("Bitset offset too large: {relative_start}"))
+            })?;
+            buffer.slice(bitset_start..)
+        } else {
+            self.input.0.get_bytes(info.bitset_range.clone()).await?
+        };
+
+        decode_bloom_filter_bitset(&info, &bitset).map(Some)
     }
 
     /// Select row groups and rows using row-group-local coordinates.
