@@ -42,7 +42,7 @@ use crate::arrow::arrow_reader::{
 
 use crate::bloom_filter::Sbbf;
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use crate::file::metadata::{BloomFilterPolicy, ParquetMetaData, ParquetMetaDataReader};
 
 mod metadata;
 pub use metadata::*;
@@ -268,7 +268,13 @@ impl ArrowReaderMetadata {
         input: &mut T,
         options: ArrowReaderOptions,
     ) -> Result<Self> {
-        let metadata = input.get_metadata(Some(&options)).await?;
+        let mut metadata = input.get_metadata(Some(&options)).await?;
+        if !matches!(options.bloom_filter_policy(), BloomFilterPolicy::Skip) {
+            let mut reader = ParquetMetaDataReader::new_with_metadata((*metadata).clone())
+                .with_bloom_filter_policy(options.bloom_filter_policy().clone());
+            reader.load_bloom_filters(&mut *input).await?;
+            metadata = Arc::new(reader.finish()?);
+        }
         Self::try_new(metadata, options)
     }
 }
@@ -993,12 +999,13 @@ mod tests {
     use crate::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     use crate::arrow::schema::virtual_type::RowNumber;
     use crate::basic::Encoding;
-    use crate::file::metadata::PageIndexPolicy;
-    use crate::file::metadata::ParquetMetaDataReader;
     use crate::file::metadata::page_index::PageIndex;
+    use crate::file::metadata::{
+        BloomFilterStatus, ColumnChunkMask, PageIndexPolicy, ParquetMetaDataReader,
+    };
     use crate::file::properties::WriterProperties;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
+    use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use std::sync::{Arc, Mutex};
@@ -1043,6 +1050,42 @@ mod tests {
             ));
             futures::future::ready(Ok(self.metadata.clone().unwrap().clone())).boxed()
         }
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_options_propagate_through_async_metadata() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .build();
+        let mut data = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut data, schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let options = ArrowReaderOptions::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([1])));
+        let mut input = TestReader::new(data.into());
+        let metadata = ArrowReaderMetadata::load_async(&mut input, options)
+            .await
+            .unwrap();
+        let provider = metadata.metadata.bloom_filters().unwrap();
+        assert_eq!(provider.status(0, 0).unwrap(), BloomFilterStatus::NotLoaded);
+        assert!(matches!(
+            provider.status(0, 1).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
     }
 
     #[tokio::test]

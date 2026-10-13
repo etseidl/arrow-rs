@@ -42,7 +42,7 @@ use crate::column::page::{PageIterator, PageReader};
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{
-    ColumnChunkMask, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
+    BloomFilterPolicy, ColumnChunkMask, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
     ParquetMetaDataReader, ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use crate::file::reader::{ChunkReader, SerializedPageReader};
@@ -594,6 +594,7 @@ pub struct ArrowReaderOptions {
     offset_index: PageIndexPolicy,
     column_index_mask: ColumnChunkMask,
     offset_index_mask: ColumnChunkMask,
+    bloom_filter_policy: BloomFilterPolicy,
 
     /// Options to control reading of Parquet metadata
     metadata_options: ParquetMetaDataOptions,
@@ -816,6 +817,14 @@ impl ArrowReaderOptions {
         self
     }
 
+    /// Sets the policy and column-chunk mask for eagerly loading decoded Bloom filters.
+    ///
+    /// The default is [`BloomFilterPolicy::Skip`].
+    pub fn with_bloom_filter_policy(mut self, policy: BloomFilterPolicy) -> Self {
+        self.bloom_filter_policy = policy;
+        self
+    }
+
     /// Provide a Parquet schema to use when decoding the metadata. The schema in the Parquet
     /// footer will be skipped.
     ///
@@ -982,6 +991,11 @@ impl ArrowReaderOptions {
         &self.column_index_mask
     }
 
+    /// Retrieve the policy and column-chunk mask for eagerly loading decoded Bloom filters.
+    pub fn bloom_filter_policy(&self) -> &BloomFilterPolicy {
+        &self.bloom_filter_policy
+    }
+
     /// Retrieve the currently set metadata decoding options.
     pub fn metadata_options(&self) -> &ParquetMetaDataOptions {
         &self.metadata_options
@@ -1000,12 +1014,14 @@ impl ArrowReaderOptions {
 impl ParquetMetaDataReader {
     /// Applies the metadata related settings from [`ArrowReaderOptions`],
     /// such as the [`ParquetMetaDataOptions`], decryption properties, and
-    /// [`PageIndexPolicy`] to this reader.
+    /// [`PageIndexPolicy`] and [`BloomFilterPolicy`] to this reader.
     ///
     /// The page index policies are only applied if at least one of them is not
     /// [`PageIndexPolicy::Skip`], so policies previously configured on this
     /// reader (e.g. from a preload setting) are preserved when the options do
     /// not request the page index.
+    /// Likewise, [`BloomFilterPolicy::Skip`] preserves Bloom-filter policy configured directly on
+    /// this reader, while `Optional(mask)` replaces the complete policy, including its mask.
     ///
     /// This encodes the canonical way to construct a `ParquetMetaDataReader`
     /// inside `AsyncFileReader::get_metadata` (available with the `async`
@@ -1041,6 +1057,10 @@ impl ParquetMetaDataReader {
         }
         if !options.offset_index_mask().is_all() {
             self = self.with_offset_index_mask(options.offset_index_mask().clone());
+        }
+
+        if !matches!(options.bloom_filter_policy(), BloomFilterPolicy::Skip) {
+            self = self.with_bloom_filter_policy(options.bloom_filter_policy().clone());
         }
 
         self
@@ -1080,22 +1100,13 @@ impl ArrowReaderMetadata {
     ///
     /// # Notes
     ///
-    /// If `options` indicates the page index should be read, but
-    /// `Self::metadata` is missing the page index, this function will attempt
-    /// to load the page index by making an object store request.
+    /// Requested page indexes and Bloom filters are loaded from `reader`. Existing Bloom-filter
+    /// cache entries are reused, and only selected `NotLoaded` coordinates are read.
     ///
-    /// See [`ArrowReaderOptions::with_page_index_policy`] for more information on the page index.
+    /// See [`ArrowReaderOptions::with_page_index_policy`] and
+    /// [`ArrowReaderOptions::with_bloom_filter_policy`] for more information.
     pub fn load<T: ChunkReader>(reader: &T, options: ArrowReaderOptions) -> Result<Self> {
-        let metadata = ParquetMetaDataReader::new()
-            .with_column_index_policy(options.column_index_policy())
-            .with_offset_index_policy(options.offset_index_policy())
-            .with_column_index_mask(options.column_index_mask().clone())
-            .with_offset_index_mask(options.offset_index_mask().clone())
-            .with_metadata_options(Some(options.metadata_options.clone()));
-        #[cfg(feature = "encryption")]
-        let metadata = metadata.with_decryption_properties(
-            options.file_decryption_properties.as_ref().map(Arc::clone),
-        );
+        let metadata = ParquetMetaDataReader::new().with_arrow_reader_options(Some(&options));
         let metadata = metadata.parse_and_finish(reader)?;
         Self::try_new(Arc::new(metadata), options)
     }
@@ -1105,8 +1116,9 @@ impl ArrowReaderMetadata {
     ///
     /// # Notes
     ///
-    /// This function will not attempt to load the PageIndex if not present in the metadata, regardless
-    /// of the settings in `options`. See [`Self::load`] to load metadata including the page index if needed.
+    /// This function performs no I/O. It therefore does not load missing page indexes or Bloom
+    /// filters regardless of `options`, and preserves any attached providers as-is. See
+    /// [`Self::load`] when an input reader is available.
     pub fn try_new(metadata: Arc<ParquetMetaData>, options: ArrowReaderOptions) -> Result<Self> {
         match options.supplied_schema {
             Some(supplied_schema) => Self::with_supplied_schema(

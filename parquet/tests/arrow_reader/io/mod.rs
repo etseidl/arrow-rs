@@ -127,15 +127,7 @@ impl AsyncFileReader for TestReader {
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        let mut metadata_reader = ParquetMetaDataReader::new();
-
-        if let Some(options) = options {
-            metadata_reader = metadata_reader
-                .with_column_index_policy(options.column_index_policy())
-                .with_offset_index_policy(options.offset_index_policy())
-                .with_column_index_mask(options.column_index_mask().clone())
-                .with_offset_index_mask(options.offset_index_mask().clone());
-        }
+        let metadata_reader = ParquetMetaDataReader::new().with_arrow_reader_options(options);
 
         self.metadata = Some(Arc::new(
             metadata_reader.parse_and_finish(&self.data).unwrap(),

@@ -24,7 +24,9 @@ use crate::bloom_filter::{
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::FOOTER_SIZE;
-use crate::file::metadata::bloom_filter::BloomFilterIndexBuilder;
+use crate::file::metadata::bloom_filter::{
+    BloomFilterIndexBuilder, BloomFilterStatus, merge_bloom_filter_provider,
+};
 use crate::file::metadata::page_index::PageIndex;
 use crate::file::metadata::parser::{MetadataParser, parse_page_index};
 use crate::file::metadata::{
@@ -483,7 +485,11 @@ impl ParquetMetaDataPushDecoder {
                         Ok(DecodeResult::Data(bloom_filters)) => {
                             let mut metadata = *metadata;
                             if let Some(bloom_filters) = bloom_filters {
-                                metadata.set_bloom_filters(Some(Arc::new(bloom_filters)));
+                                let existing = metadata.bloom_filters().cloned();
+                                metadata.set_bloom_filters(Some(merge_bloom_filter_provider(
+                                    existing,
+                                    bloom_filters,
+                                )));
                             }
                             self.state = DecodeState::Finished;
                             return Ok(DecodeResult::Data(metadata));
@@ -610,6 +616,7 @@ impl ParquetMetaDataPushDecoder {
             .max()
             .unwrap_or_default();
         let mut selected = false;
+        let mut needs_load = false;
         let mut missing = Vec::new();
 
         // First round: known lengths request the complete filter; unknown lengths request enough
@@ -619,6 +626,10 @@ impl ParquetMetaDataPushDecoder {
             let row_group = metadata.row_group(row_group_idx);
             for column_idx in mask.column_indices(row_group.num_columns()) {
                 selected = true;
+                if !bloom_filter_needs_load(metadata, row_group_idx, column_idx)? {
+                    continue;
+                }
+                needs_load = true;
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
                     continue;
@@ -637,7 +648,7 @@ impl ParquetMetaDataPushDecoder {
             }
         }
 
-        if !selected {
+        if !selected || !needs_load {
             return Ok(DecodeResult::Data(None));
         }
         if !missing.is_empty() {
@@ -649,6 +660,9 @@ impl ParquetMetaDataPushDecoder {
         for row_group_idx in mask.row_group_indices(num_row_groups) {
             let row_group = metadata.row_group(row_group_idx);
             for column_idx in mask.column_indices(row_group.num_columns()) {
+                if !bloom_filter_needs_load(metadata, row_group_idx, column_idx)? {
+                    continue;
+                }
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
                     continue;
@@ -677,6 +691,9 @@ impl ParquetMetaDataPushDecoder {
         for row_group_idx in mask.row_group_indices(num_row_groups) {
             let row_group = metadata.row_group(row_group_idx);
             for column_idx in mask.column_indices(row_group.num_columns()) {
+                if !bloom_filter_needs_load(metadata, row_group_idx, column_idx)? {
+                    continue;
+                }
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
                     builder.put_absent(row_group_idx, column_idx)?;
@@ -793,6 +810,20 @@ enum DecodeState {
 fn deduplicate_ranges(ranges: &mut Vec<Range<u64>>) {
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     ranges.dedup_by_key(|range| (range.start, range.end));
+}
+
+fn bloom_filter_needs_load(
+    metadata: &ParquetMetaData,
+    row_group_idx: usize,
+    column_idx: usize,
+) -> Result<bool> {
+    match metadata.bloom_filters() {
+        Some(provider) => Ok(matches!(
+            provider.status(row_group_idx, column_idx)?,
+            BloomFilterStatus::NotLoaded
+        )),
+        None => Ok(true),
+    }
 }
 
 /// Returns the byte range needed to read the offset/page indexes, based on the

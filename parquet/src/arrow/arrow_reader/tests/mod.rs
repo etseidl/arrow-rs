@@ -54,7 +54,10 @@ use crate::data_type::{
     FixedLenByteArrayType, FloatType, Int32Type, Int64Type, Int96, Int96Type,
 };
 use crate::errors::Result;
-use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetStatisticsPolicy};
+use crate::file::metadata::{
+    BloomFilterPolicy, BloomFilterStatus, ColumnChunkMask, PageIndexPolicy, ParquetMetaData,
+    ParquetMetaDataReader, ParquetStatisticsPolicy,
+};
 use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use crate::schema::parser::parse_message_type;

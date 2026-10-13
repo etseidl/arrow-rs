@@ -21,13 +21,14 @@ use crate::arrow::ProjectionMask;
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::FOOTER_SIZE;
+use crate::file::metadata::bloom_filter::merge_bloom_filter_provider;
 #[cfg(feature = "arrow")]
 use crate::file::metadata::dictionary::decode_dictionary_page;
 use crate::file::metadata::page_index::{PageIndex, PageIndexProvider};
 use crate::file::metadata::parser::decode_metadata;
 use crate::file::metadata::thrift::parquet_schema_from_bytes;
 use crate::file::metadata::{
-    BloomFilterIndex, BloomFilterProvider, FooterTail, ParquetMetaData, ParquetMetaDataOptions,
+    BloomFilterIndex, FooterTail, ParquetMetaData, ParquetMetaDataOptions,
     ParquetMetaDataPushDecoder,
 };
 use crate::file::reader::ChunkReader;
@@ -744,8 +745,8 @@ impl ParquetMetaDataReader {
     ) -> Result<()> {
         let (mut metadata, bloom_filters) = self.read_bloom_filter_sized_impl(reader, file_size)?;
         if let Some(bloom_filters) = bloom_filters {
-            metadata
-                .set_bloom_filters(Some(Arc::new(bloom_filters) as Arc<dyn BloomFilterProvider>));
+            let existing = metadata.bloom_filters().cloned();
+            metadata.set_bloom_filters(Some(merge_bloom_filter_provider(existing, bloom_filters)));
         }
         self.metadata = Some(metadata);
         Ok(())
@@ -1076,8 +1077,8 @@ impl ParquetMetaDataReader {
             .load_bloom_filter_with_remainder_impl(fetch, remainder, file_size)
             .await?;
         if let Some(bloom_filters) = bloom_filters {
-            metadata
-                .set_bloom_filters(Some(Arc::new(bloom_filters) as Arc<dyn BloomFilterProvider>));
+            let existing = metadata.bloom_filters().cloned();
+            metadata.set_bloom_filters(Some(merge_bloom_filter_provider(existing, bloom_filters)));
         }
         self.metadata = Some(metadata);
         Ok(())
@@ -1772,7 +1773,7 @@ mod tests {
             .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([1])))
             .read_bloom_filter_and_finish(&file)
             .unwrap();
-        assert!(filters.is_some());
+        assert!(filters.is_none());
         assert!(Arc::ptr_eq(metadata.bloom_filters().unwrap(), &original));
     }
 
@@ -2029,6 +2030,42 @@ mod async_tests {
             BloomFilterStatus::Present(_)
         ));
         assert_eq!(batch_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_existing_cache_fetches_only_missing_entries() {
+        let data = bloom_test_bytes();
+        let partial = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])))
+            .parse_and_finish(&data)
+            .unwrap();
+
+        let mut input = CountingAsyncReader::new(data.clone());
+        let batch_requests = Arc::clone(&input.batch_requests);
+        let batch_ranges = Arc::clone(&input.batch_ranges);
+        let mut loader = ParquetMetaDataReader::new_with_metadata(partial)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()));
+        loader.load_bloom_filters(&mut input).await.unwrap();
+        let complete = loader.finish().unwrap();
+
+        let provider = complete.bloom_filters().unwrap();
+        assert!(matches!(
+            provider.status(0, 0).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
+        assert!(matches!(
+            provider.status(0, 1).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_ranges.load(Ordering::SeqCst), 1);
+
+        let mut input = CountingAsyncReader::new(data);
+        let batch_requests = Arc::clone(&input.batch_requests);
+        let mut loader = ParquetMetaDataReader::new_with_metadata(complete)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()));
+        loader.load_bloom_filters(&mut input).await.unwrap();
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

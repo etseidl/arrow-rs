@@ -19,6 +19,101 @@
 
 use super::*;
 
+fn bloom_filter_test_data() -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", ArrowDataType::Int32, false),
+        Field::new("b", ArrowDataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_bloom_filter_enabled(true)
+        .build();
+    let mut data = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut data, schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    data.into()
+}
+
+#[test]
+fn test_bloom_filter_options_and_sync_propagation() {
+    let default_options = ArrowReaderOptions::default();
+    assert_eq!(
+        default_options.bloom_filter_policy(),
+        &BloomFilterPolicy::Skip
+    );
+
+    let policy = BloomFilterPolicy::Optional(ColumnChunkMask::columns([1]));
+    let options = ArrowReaderOptions::new().with_bloom_filter_policy(policy.clone());
+    assert_eq!(options.bloom_filter_policy(), &policy);
+
+    let data = bloom_filter_test_data();
+    let default_builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        data.clone(),
+        ArrowReaderOptions::default(),
+    )
+    .unwrap();
+    assert!(default_builder.metadata().bloom_filters().is_none());
+
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new_with_options(data.clone(), options).unwrap();
+    let provider = builder.metadata().bloom_filters().unwrap();
+    assert_eq!(provider.status(0, 0).unwrap(), BloomFilterStatus::NotLoaded);
+    assert!(matches!(
+        provider.status(0, 1).unwrap(),
+        BloomFilterStatus::Present(_)
+    ));
+
+    let metadata = ParquetMetaDataReader::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])))
+        .with_arrow_reader_options(Some(&ArrowReaderOptions::default()))
+        .parse_and_finish(&data)
+        .unwrap();
+    let provider = metadata.bloom_filters().unwrap();
+    assert!(matches!(
+        provider.status(0, 0).unwrap(),
+        BloomFilterStatus::Present(_)
+    ));
+    assert_eq!(provider.status(0, 1).unwrap(), BloomFilterStatus::NotLoaded);
+
+    let override_options = ArrowReaderOptions::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([1])));
+    let metadata = ParquetMetaDataReader::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])))
+        .with_arrow_reader_options(Some(&override_options))
+        .parse_and_finish(&data)
+        .unwrap();
+    let provider = metadata.bloom_filters().unwrap();
+    assert_eq!(provider.status(0, 0).unwrap(), BloomFilterStatus::NotLoaded);
+    assert!(matches!(
+        provider.status(0, 1).unwrap(),
+        BloomFilterStatus::Present(_)
+    ));
+
+    let partial = ParquetMetaDataReader::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])))
+        .parse_and_finish(&data)
+        .unwrap();
+    let original = Arc::clone(partial.bloom_filters().unwrap());
+    let metadata = ArrowReaderMetadata::try_new(
+        Arc::new(partial),
+        ArrowReaderOptions::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all())),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        metadata.metadata.bloom_filters().unwrap(),
+        &original
+    ));
+}
+
 #[test]
 fn test_page_encoding_stats_mask() {
     let testdata = arrow::util::test_util::parquet_test_data();

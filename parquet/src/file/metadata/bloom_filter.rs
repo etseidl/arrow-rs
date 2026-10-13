@@ -60,6 +60,41 @@ pub trait BloomFilterProvider: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Overlays newly loaded entries on an existing provider without cloning either cache.
+#[derive(Debug)]
+struct CompositeBloomFilterProvider {
+    loaded: Arc<dyn BloomFilterProvider>,
+    existing: Arc<dyn BloomFilterProvider>,
+}
+
+impl BloomFilterProvider for CompositeBloomFilterProvider {
+    fn status(&self, row_group_idx: usize, column_idx: usize) -> Result<BloomFilterStatus<'_>> {
+        match self.loaded.status(row_group_idx, column_idx)? {
+            BloomFilterStatus::NotLoaded => self.existing.status(row_group_idx, column_idx),
+            status => Ok(status),
+        }
+    }
+
+    fn has_bloom_filters(&self) -> bool {
+        self.loaded.has_bloom_filters() || self.existing.has_bloom_filters()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub(crate) fn merge_bloom_filter_provider(
+    existing: Option<Arc<dyn BloomFilterProvider>>,
+    loaded: BloomFilterIndex,
+) -> Arc<dyn BloomFilterProvider> {
+    let loaded: Arc<dyn BloomFilterProvider> = Arc::new(loaded);
+    match existing {
+        Some(existing) => Arc::new(CompositeBloomFilterProvider { loaded, existing }),
+        None => loaded,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum BloomFilterEntry {
     Absent,
@@ -284,6 +319,29 @@ mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    #[derive(Debug)]
+    struct CustomProvider(Sbbf);
+
+    impl BloomFilterProvider for CustomProvider {
+        fn status(&self, row_group_idx: usize, column_idx: usize) -> Result<BloomFilterStatus<'_>> {
+            match (row_group_idx, column_idx) {
+                (0, 0) => Ok(BloomFilterStatus::Present(&self.0)),
+                (0, 1) => Ok(BloomFilterStatus::NotLoaded),
+                _ => Err(ParquetError::General(
+                    "test coordinate out of bounds".into(),
+                )),
+            }
+        }
+
+        fn has_bloom_filters(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     fn filter(seed: u8) -> Sbbf {
         let mut bytes = vec![0; 32];
         bytes[0] = seed;
@@ -406,5 +464,20 @@ mod tests {
 
         assert!(absent.heap_size() > empty.heap_size());
         assert!(present.heap_size() > absent.heap_size());
+    }
+
+    #[test]
+    fn loaded_entries_overlay_custom_provider() {
+        let expected = filter(9);
+        let existing: Arc<dyn BloomFilterProvider> = Arc::new(CustomProvider(expected.clone()));
+        let mut loaded = BloomFilterIndexBuilder::try_new(1, 2).unwrap();
+        loaded.put_absent(0, 1).unwrap();
+        let merged = merge_bloom_filter_provider(Some(existing), loaded.try_build().unwrap());
+
+        assert_eq!(
+            merged.status(0, 0).unwrap(),
+            BloomFilterStatus::Present(&expected)
+        );
+        assert_eq!(merged.status(0, 1).unwrap(), BloomFilterStatus::Absent);
     }
 }
