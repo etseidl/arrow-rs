@@ -50,6 +50,7 @@
 //!
 //! [`external_metadata.rs`]: https://github.com/apache/arrow-rs/tree/master/parquet/examples/external_metadata.rs
 //!
+pub mod bloom_filter;
 mod column_chunk;
 #[cfg(feature = "arrow")]
 mod dictionary;
@@ -93,6 +94,10 @@ use crate::{
     data_type::private::ParquetValueType, file::page_index::offset_index::OffsetIndexMetaData,
 };
 
+pub use bloom_filter::{
+    BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterProvider, BloomFilterStatus,
+    RowGroupBloomFilters,
+};
 pub use footer_tail::FooterTail;
 pub use options::{ParquetMetaDataOptions, ParquetStatisticsPolicy};
 pub use push_decoder::ParquetMetaDataPushDecoder;

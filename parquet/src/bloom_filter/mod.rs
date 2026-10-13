@@ -115,7 +115,7 @@
 use crate::basic::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
 use crate::data_type::AsBytes;
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::ColumnChunkMetaData;
+use crate::file::metadata::{ColumnChunkMetaData, HeapSize};
 use crate::file::reader::ChunkReader;
 use crate::parquet_thrift::{
     ElementType, FieldType, ReadThrift, ThriftCompactInputProtocol, ThriftCompactOutputProtocol,
@@ -320,6 +320,12 @@ impl Block {
 /// struct set via [`crate::file::properties::WriterProperties`] and is thus hidden by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sbbf(Vec<Block>);
+
+impl HeapSize for Sbbf {
+    fn heap_size(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<Block>()
+    }
+}
 
 pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
 

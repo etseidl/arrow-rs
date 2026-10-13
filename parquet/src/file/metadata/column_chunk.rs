@@ -97,6 +97,14 @@ impl<T> ColumnChunkMap<T> {
         self.entries.is_empty()
     }
 
+    pub(crate) fn num_row_groups(&self) -> usize {
+        self.num_row_groups
+    }
+
+    pub(crate) fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
     fn key(&self, row_group_idx: usize, column_idx: usize) -> Result<ColumnChunkKey> {
         if row_group_idx >= self.num_row_groups || column_idx >= self.num_columns {
             return Err(ParquetError::General(format!(
@@ -125,6 +133,29 @@ impl<T> ColumnChunkMap<T> {
             })?;
         }
         Ok(self.entries.insert(key, value))
+    }
+
+    /// Inserts an entry, rejecting an already-covered coordinate.
+    pub(crate) fn try_insert_vacant(
+        &mut self,
+        row_group_idx: usize,
+        column_idx: usize,
+        value: Arc<T>,
+    ) -> Result<()> {
+        let key = self.key(row_group_idx, column_idx)?;
+        if self.entries.contains_key(&key) {
+            return Err(ParquetError::General(format!(
+                "duplicate column chunk coordinate: row group {row_group_idx}, column {column_idx}"
+            )));
+        }
+        self.entries.try_reserve(1).map_err(|err| {
+            ParquetError::General(format!(
+                "failed to allocate column chunk map entry at row group {row_group_idx}, column \
+                 {column_idx}: {err}"
+            ))
+        })?;
+        self.entries.insert(key, value);
+        Ok(())
     }
 
     pub(crate) fn try_freeze(self) -> Result<ColumnChunkEntries<T>> {
@@ -210,6 +241,18 @@ impl<T> ColumnChunkEntries<T> {
         self.entries.is_empty()
     }
 
+    pub(crate) fn num_row_groups(&self) -> usize {
+        self.num_row_groups
+    }
+
+    pub(crate) fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn key(&self, row_group_idx: usize, column_idx: usize) -> Result<ColumnChunkKey> {
         if row_group_idx >= self.num_row_groups || column_idx >= self.num_columns {
             return Err(ParquetError::General(format!(
@@ -237,7 +280,6 @@ impl<T> ColumnChunkEntries<T> {
         Ok(Some(value.as_ref()))
     }
 
-    #[cfg_attr(not(test), expect(unused))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (ColumnChunkKey, &T)> {
         self.entries
             .iter()
