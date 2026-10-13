@@ -86,7 +86,6 @@ pub struct ParquetMetaDataReader {
     column_index_mask: ColumnChunkMask,
     offset_index_mask: ColumnChunkMask,
     bloom_filter_policy: BloomFilterPolicy,
-    bloom_filter_mask: ColumnChunkMask,
     prefetch_hint: Option<usize>,
     metadata_options: Option<Arc<ParquetMetaDataOptions>>,
     // Size of the serialized thrift metadata plus the 8 byte footer. Only set if
@@ -118,15 +117,15 @@ pub enum PageIndexPolicy {
 }
 
 /// Describes the policy for eagerly loading decoded Bloom filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BloomFilterPolicy {
     /// Do not load Bloom filters. Any provider already attached to metadata is preserved.
     #[default]
     Skip,
-    /// Load selected Bloom filters, recording missing filters as known absences.
+    /// Load Bloom filters selected by the mask, recording missing filters as known absences.
     ///
     /// Corrupt filters advertised by the footer still produce an error.
-    Optional,
+    Optional(ColumnChunkMask),
 }
 
 impl From<bool> for PageIndexPolicy {
@@ -149,7 +148,7 @@ impl From<bool> for PageIndexPolicy {
 /// Because Parquet collection cannot contain more than [`i32::MAX`] values, user provided indices
 /// outside that range will be discarded.
 ///
-/// At present this is only used to select elements of the [Page Index] for decoding.
+/// This is used to select elements of the [Page Index] and Bloom filters for decoding.
 ///
 /// # Examples
 ///
@@ -419,13 +418,6 @@ impl ParquetMetaDataReader {
     /// [`BloomFilterPolicy::Skip`].
     pub fn with_bloom_filter_policy(mut self, policy: BloomFilterPolicy) -> Self {
         self.bloom_filter_policy = policy;
-        self
-    }
-
-    /// Selects the row groups and leaf columns whose Bloom filters are loaded. By default, all
-    /// column chunks are selected.
-    pub fn with_bloom_filter_mask(mut self, mask: ColumnChunkMask) -> Self {
-        self.bloom_filter_mask = mask;
         self
     }
 
@@ -770,8 +762,7 @@ impl ParquetMetaDataReader {
             .ok_or_else(|| general_err!("Tried to read Bloom filters without footer metadata"))?
             .clone();
         let decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
-            .with_bloom_filter_policy(self.bloom_filter_policy)
-            .with_bloom_filter_mask(self.bloom_filter_mask.clone())
+            .with_bloom_filter_policy(self.bloom_filter_policy.clone())
             .with_metadata_options(self.metadata_options.clone());
         let mut decoder = self.prepare_push_decoder(decoder);
         let file_range = file_size.saturating_sub(reader.len())..file_size;
@@ -1105,8 +1096,7 @@ impl ParquetMetaDataReader {
             .ok_or_else(|| general_err!("Footer metadata is not present"))?
             .clone();
         let decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
-            .with_bloom_filter_policy(self.bloom_filter_policy)
-            .with_bloom_filter_mask(self.bloom_filter_mask.clone())
+            .with_bloom_filter_policy(self.bloom_filter_policy.clone())
             .with_metadata_options(self.metadata_options.clone());
         let mut decoder = self.prepare_push_decoder(decoder);
         if let Some((start, bytes)) = remainder {
@@ -1743,8 +1733,7 @@ mod tests {
     fn test_read_bloom_filters_policy_and_mask() {
         let file = bloom_test_file(true);
         let metadata = ParquetMetaDataReader::new()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-            .with_bloom_filter_mask(ColumnChunkMask::columns([0]))
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])))
             .parse_and_finish(&file)
             .unwrap();
         let filters = metadata.bloom_filters().unwrap();
@@ -1756,7 +1745,7 @@ mod tests {
 
         let absent_file = bloom_test_file(false);
         let metadata = ParquetMetaDataReader::new()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()))
             .parse_and_finish(&absent_file)
             .unwrap();
         let filters = metadata.bloom_filters().unwrap();
@@ -1769,7 +1758,7 @@ mod tests {
     fn test_read_bloom_filter_and_finish_preserves_attached_provider() {
         let file = bloom_test_file(true);
         let loaded = ParquetMetaDataReader::new()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()))
             .parse_and_finish(&file)
             .unwrap();
         let original = Arc::clone(loaded.bloom_filters().unwrap());
@@ -1780,8 +1769,7 @@ mod tests {
             .set_bloom_filters(Some(Arc::clone(&original)))
             .build();
         let (metadata, filters) = ParquetMetaDataReader::new_with_metadata(footer_only)
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-            .with_bloom_filter_mask(ColumnChunkMask::columns([1]))
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([1])))
             .read_bloom_filter_and_finish(&file)
             .unwrap();
         assert!(filters.is_some());
@@ -1804,8 +1792,7 @@ mod tests {
             .unwrap();
 
         let mut reader = ParquetMetaDataReader::new_with_metadata(metadata)
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-            .with_bloom_filter_mask(ColumnChunkMask::columns([0]));
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])));
         assert!(reader.read_bloom_filters(&file).is_err());
         assert!(reader.has_metadata());
     }
@@ -1999,14 +1986,14 @@ mod async_tests {
     async fn test_bloom_filter_batch_fetch_and_sync_equivalence() {
         let data = bloom_test_bytes();
         let expected = ParquetMetaDataReader::new()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()))
             .parse_and_finish(&data)
             .unwrap();
         let mut input = CountingAsyncReader::new(data.clone());
         let batch_requests = Arc::clone(&input.batch_requests);
         let batch_ranges = Arc::clone(&input.batch_ranges);
         let actual = ParquetMetaDataReader::new()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()))
             .load_and_finish(&mut input, data.len() as u64)
             .await
             .unwrap();
@@ -2033,8 +2020,7 @@ mod async_tests {
         let mut input = CountingAsyncReader::new(data);
         let batch_requests = Arc::clone(&input.batch_requests);
         let mut loader = ParquetMetaDataReader::new_with_metadata(metadata)
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-            .with_bloom_filter_mask(ColumnChunkMask::columns([0]));
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])));
         loader.load_bloom_filters(&mut input).await.unwrap();
         let metadata = loader.finish().unwrap();
 
@@ -2070,7 +2056,7 @@ mod async_tests {
             (MalformedBatch::WrongLength, "does not match length"),
         ] {
             let mut reader = ParquetMetaDataReader::new_with_metadata(metadata.clone())
-                .with_bloom_filter_policy(BloomFilterPolicy::Optional);
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()));
             let err = reader
                 .load_bloom_filters(MalformedBatchFetch { mode })
                 .await

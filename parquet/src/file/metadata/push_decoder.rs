@@ -240,8 +240,6 @@ pub struct ParquetMetaDataPushDecoder {
     offset_index_mask: ColumnChunkMask,
     /// policy for eagerly loading Bloom filters
     bloom_filter_policy: BloomFilterPolicy,
-    /// selected Bloom-filter row groups and columns
-    bloom_filter_mask: ColumnChunkMask,
     /// Underlying buffers
     buffers: crate::util::push_buffers::PushBuffers,
     /// Encryption API
@@ -269,7 +267,6 @@ impl ParquetMetaDataPushDecoder {
             column_index_mask: ColumnChunkMask::all(),
             offset_index_mask: ColumnChunkMask::all(),
             bloom_filter_policy: BloomFilterPolicy::Skip,
-            bloom_filter_mask: ColumnChunkMask::all(),
             buffers: crate::util::push_buffers::PushBuffers::new(file_len),
             metadata_parser: MetadataParser::new(),
         })
@@ -350,13 +347,6 @@ impl ParquetMetaDataPushDecoder {
     /// [`BloomFilterPolicy::Skip`].
     pub fn with_bloom_filter_policy(mut self, policy: BloomFilterPolicy) -> Self {
         self.bloom_filter_policy = policy;
-        self
-    }
-
-    /// Selects the row groups and leaf columns whose Bloom filters are loaded. By default, all
-    /// column chunks are selected.
-    pub fn with_bloom_filter_mask(mut self, mask: ColumnChunkMask) -> Self {
-        self.bloom_filter_mask = mask;
         self
     }
 
@@ -608,9 +598,9 @@ impl ParquetMetaDataPushDecoder {
         &self,
         metadata: &ParquetMetaData,
     ) -> Result<DecodeResult<Option<BloomFilterIndex>>> {
-        if self.bloom_filter_policy == BloomFilterPolicy::Skip {
+        let BloomFilterPolicy::Optional(mask) = &self.bloom_filter_policy else {
             return Ok(DecodeResult::Data(None));
-        }
+        };
 
         let num_row_groups = metadata.num_row_groups();
         let num_columns = metadata
@@ -625,12 +615,9 @@ impl ParquetMetaDataPushDecoder {
         // First round: known lengths request the complete filter; unknown lengths request enough
         // bytes to decode the Thrift header. Ranges remain disjoint and are not widened across
         // intervening column data.
-        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+        for row_group_idx in mask.row_group_indices(num_row_groups) {
             let row_group = metadata.row_group(row_group_idx);
-            for column_idx in self
-                .bloom_filter_mask
-                .column_indices(row_group.num_columns())
-            {
+            for column_idx in mask.column_indices(row_group.num_columns()) {
                 selected = true;
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
@@ -659,12 +646,9 @@ impl ParquetMetaDataPushDecoder {
         }
 
         // Second round: headers without an advertised total length reveal the exact bitset range.
-        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+        for row_group_idx in mask.row_group_indices(num_row_groups) {
             let row_group = metadata.row_group(row_group_idx);
-            for column_idx in self
-                .bloom_filter_mask
-                .column_indices(row_group.num_columns())
-            {
+            for column_idx in mask.column_indices(row_group.num_columns()) {
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
                     continue;
@@ -690,12 +674,9 @@ impl ParquetMetaDataPushDecoder {
         }
 
         let mut builder = BloomFilterIndexBuilder::try_new(num_row_groups, num_columns)?;
-        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+        for row_group_idx in mask.row_group_indices(num_row_groups) {
             let row_group = metadata.row_group(row_group_idx);
-            for column_idx in self
-                .bloom_filter_mask
-                .column_indices(row_group.num_columns())
-            {
+            for column_idx in mask.column_indices(row_group.num_columns()) {
                 let column = row_group.column(column_idx);
                 let Some((offset, total_len)) = bloom_filter_location(column)? else {
                     builder.put_absent(row_group_idx, column_idx)?;
@@ -986,8 +967,9 @@ mod tests {
         let mut decoder =
             ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
                 .unwrap()
-                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([1], [0, 1]));
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional(
+                    ColumnChunkMask::row_groups_and_columns([1], [0, 1]),
+                ));
 
         let ranges = expect_needs_data(decoder.try_decode_bloom_filters());
         assert_eq!(ranges.len(), 1, "only column a has a filter");
@@ -1021,8 +1003,9 @@ mod tests {
         let mut decoder =
             ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
                 .unwrap()
-                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([0], [0]));
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional(
+                    ColumnChunkMask::row_groups_and_columns([0], [0]),
+                ));
 
         let header_ranges = expect_needs_data(decoder.try_decode_bloom_filters());
         assert_eq!(header_ranges.len(), 1);
@@ -1051,8 +1034,9 @@ mod tests {
         let mut decoder =
             ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
                 .unwrap()
-                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
-                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([0], [0]));
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional(
+                    ColumnChunkMask::row_groups_and_columns([0], [0]),
+                ));
         let ranges = expect_needs_data(decoder.try_decode_bloom_filters());
         push_ranges_to_metadata_decoder(&mut decoder, ranges);
 
@@ -1078,9 +1062,8 @@ mod tests {
                     .with_bloom_filter_policy(if mask.is_all() {
                         BloomFilterPolicy::Skip
                     } else {
-                        BloomFilterPolicy::Optional
-                    })
-                    .with_bloom_filter_mask(mask);
+                        BloomFilterPolicy::Optional(mask)
+                    });
             let (metadata, index) = expect_data(decoder.try_decode_bloom_filters());
             assert!(index.is_none());
             assert!(Arc::ptr_eq(metadata.bloom_filters().unwrap(), &provider));
@@ -1091,7 +1074,7 @@ mod tests {
     fn test_normal_decode_attaches_bloom_filters() {
         let mut decoder = ParquetMetaDataPushDecoder::try_new(test_file_len())
             .unwrap()
-            .with_bloom_filter_policy(BloomFilterPolicy::Optional);
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()));
         push_ranges_to_metadata_decoder(&mut decoder, vec![test_file_range()]);
         let metadata = expect_data(decoder.try_decode());
         let filters = metadata.bloom_filters().unwrap();
