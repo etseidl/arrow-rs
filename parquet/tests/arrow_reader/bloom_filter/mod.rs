@@ -60,6 +60,31 @@ fn cached_bloom_filter_file() -> Bytes {
     data.into()
 }
 
+fn external_cache_file() -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(batch.num_rows()))
+        .set_column_bloom_filter_enabled(ColumnPath::from("a"), true)
+        .build();
+    let mut data = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut data, schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    data.into()
+}
+
 fn cache_options(mask: ColumnChunkMask) -> ArrowReaderOptions {
     ArrowReaderOptions::new().with_bloom_filter_policy(BloomFilterPolicy::Optional(mask))
 }

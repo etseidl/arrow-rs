@@ -15,19 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs::File;
+use std::{fs::File, sync::Arc};
 
 use bytes::Bytes;
 use parquet::{
     arrow::{
         ArrowWriter,
-        arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder},
+        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    },
+    file::metadata::{
+        BloomFilterPolicy, BloomFilterStatus, ColumnChunkMask, ParquetMetaDataBuilder,
+        ParquetMetaDataReader,
     },
     file::properties::WriterProperties,
 };
 
-use super::{CountingChunkReader, cache_options, cached_bloom_filter_file};
-use parquet::file::metadata::ColumnChunkMask;
+use super::{CountingChunkReader, cache_options, cached_bloom_filter_file, external_cache_file};
 
 #[test]
 #[cfg_attr(miri, ignore)] // Takes too long
@@ -110,6 +113,65 @@ fn test_cached_bloom_filter_status_controls_sync_io() {
     assert!(
         builder
             .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(input.request_count() > 0);
+}
+
+#[test]
+fn test_external_bloom_filter_cache_workflow() {
+    let data = external_cache_file();
+    let footer_metadata = ParquetMetaDataReader::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Skip)
+        .parse_and_finish(&data)
+        .unwrap();
+    assert_eq!(footer_metadata.num_row_groups(), 2);
+
+    let (_metadata, external_cache) = ParquetMetaDataReader::new_with_metadata(footer_metadata)
+        .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::row_groups([
+            0,
+        ])))
+        .read_bloom_filter_and_finish(&data)
+        .unwrap();
+    let external_cache = external_cache.unwrap();
+
+    let fresh_metadata = ParquetMetaDataReader::new()
+        .with_bloom_filter_policy(BloomFilterPolicy::Skip)
+        .parse_and_finish(&data)
+        .unwrap();
+    let metadata = ParquetMetaDataBuilder::new_from_metadata(fresh_metadata)
+        .set_bloom_filters(Some(Arc::new(external_cache)))
+        .build();
+    let provider = metadata.bloom_filters().unwrap();
+    assert!(matches!(
+        provider.status(0, 0).unwrap(),
+        BloomFilterStatus::Present(_)
+    ));
+    assert_eq!(provider.status(0, 1).unwrap(), BloomFilterStatus::Absent);
+    assert_eq!(provider.status(1, 0).unwrap(), BloomFilterStatus::NotLoaded);
+
+    let arrow_metadata =
+        ArrowReaderMetadata::try_new(Arc::new(metadata), ArrowReaderOptions::new()).unwrap();
+    let input = CountingChunkReader::new(data);
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(input.clone(), arrow_metadata);
+    assert!(
+        reader
+            .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reader
+            .get_row_group_column_bloom_filter(0, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(input.request_count(), 0);
+
+    assert!(
+        reader
+            .get_row_group_column_bloom_filter(1, 0)
             .unwrap()
             .is_some()
     );

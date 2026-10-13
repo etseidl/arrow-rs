@@ -731,6 +731,43 @@ impl ParquetMetaDataReader {
     /// Eagerly loads selected Bloom filters and returns them separately from the metadata.
     ///
     /// Any provider already attached to the returned metadata is left unchanged.
+    ///
+    /// # External cache example
+    ///
+    /// This example first decodes only the footer, loads a selected Bloom-filter cache separately,
+    /// and later attaches that cache to a freshly decoded copy of the metadata.
+    ///
+    /// ```no_run
+    /// # use bytes::Bytes;
+    /// # use std::sync::Arc;
+    /// # use parquet::errors::{ParquetError, Result};
+    /// # use parquet::file::metadata::{
+    /// #     BloomFilterPolicy, ColumnChunkMask, ParquetMetaData, ParquetMetaDataBuilder,
+    /// #     ParquetMetaDataReader,
+    /// # };
+    /// # fn attach_external_cache(io_source: &Bytes) -> Result<ParquetMetaData> {
+    /// let footer_metadata = ParquetMetaDataReader::new()
+    ///     .with_bloom_filter_policy(BloomFilterPolicy::Skip)
+    ///     .parse_and_finish(io_source)?;
+    ///
+    /// let metadata_reader = ParquetMetaDataReader::new_with_metadata(footer_metadata)
+    ///     .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::columns([0])));
+    /// let (_metadata, external_cache) =
+    ///     metadata_reader.read_bloom_filter_and_finish(io_source)?;
+    /// let external_cache = external_cache.ok_or_else(|| {
+    ///     ParquetError::General("Bloom-filter cache was not produced".to_string())
+    /// })?;
+    ///
+    /// // This could happen much later, using metadata freshly decoded from the same file.
+    /// let fresh_metadata = ParquetMetaDataReader::new()
+    ///     .with_bloom_filter_policy(BloomFilterPolicy::Skip)
+    ///     .parse_and_finish(io_source)?;
+    /// let metadata = ParquetMetaDataBuilder::new_from_metadata(fresh_metadata)
+    ///     .set_bloom_filters(Some(Arc::new(external_cache)))
+    ///     .build();
+    /// # Ok(metadata)
+    /// # }
+    /// ```
     pub fn read_bloom_filter_and_finish<R: ChunkReader>(
         self,
         reader: &R,

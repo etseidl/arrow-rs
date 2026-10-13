@@ -38,14 +38,20 @@ pub enum BloomFilterStatus<'a> {
 
 /// Provides already-loaded Bloom filters.
 ///
-/// Both lookup methods return an error for coordinates outside the provider's declared dimensions.
+/// [`BloomFilterStatus::Present`] is a cache hit, [`BloomFilterStatus::Absent`] is a negative-cache
+/// hit, and only [`BloomFilterStatus::NotLoaded`] permits a caller to perform fallback I/O.
+/// Out-of-bounds lookups return an error and must not trigger fallback I/O.
+///
 /// Callers that may perform fallback I/O must use [`Self::status`], because [`Self::bloom_filter`]
-/// intentionally collapses `Absent` and `NotLoaded` to `None`.
+/// intentionally collapses the two valid non-present states, `Absent` and `NotLoaded`, to `None`
+/// while still propagating lookup errors.
 pub trait BloomFilterProvider: Send + Sync + Debug {
     /// Returns the cache state for a row-group and column coordinate.
     fn status(&self, row_group_idx: usize, column_idx: usize) -> Result<BloomFilterStatus<'_>>;
 
     /// Returns a cached filter, collapsing valid non-present states to `None`.
+    ///
+    /// Use [`Self::status`] instead when `NotLoaded` should trigger fallback I/O.
     fn bloom_filter(&self, row_group_idx: usize, column_idx: usize) -> Result<Option<&Sbbf>> {
         Ok(match self.status(row_group_idx, column_idx)? {
             BloomFilterStatus::Present(filter) => Some(filter),
@@ -306,6 +312,9 @@ impl RowGroupBloomFilters {
     }
 
     /// Returns a decoded filter, collapsing valid non-present states to `None`.
+    ///
+    /// Lookup errors are propagated. Use [`Self::status`] instead when `NotLoaded` should trigger
+    /// fallback I/O.
     pub fn bloom_filter(&self, column_idx: usize) -> Result<Option<&Sbbf>> {
         Ok(match self.status(column_idx)? {
             BloomFilterStatus::Present(filter) => Some(filter),
