@@ -303,5 +303,5 @@ async fn test_external_bloom_filter_cache_workflow_async() {
             .unwrap()
             .is_some()
     );
-    assert!(input.single_request_count() > 0);
+    assert_eq!(input.single_request_count(), 1);
 }

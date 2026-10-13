@@ -28,21 +28,28 @@ use crate::schema::types::SchemaDescPtr;
 /// ```rust
 /// use parquet::file::metadata::ParquetStatisticsPolicy;
 /// use parquet::file::serialized_reader::ReadOptionsBuilder;
+/// # #[cfg(feature = "arrow")]
+/// # {
 /// use parquet::arrow::arrow_reader::ArrowReaderOptions;
 ///
 /// // Set arrow options to skip encoding statistics for all columns.
 /// let options =
 ///     ArrowReaderOptions::new().with_encoding_stats_policy(ParquetStatisticsPolicy::SkipAll);
+/// # }
 ///
 /// // Set serialized reader options to decode encoding statistics for all columns.
 /// let options =
 ///     ReadOptionsBuilder::new().with_encoding_stats_policy(ParquetStatisticsPolicy::KeepAll)
 ///     .build();
 ///
+/// # #[cfg(feature = "arrow")]
+/// # {
+/// # use parquet::arrow::arrow_reader::ArrowReaderOptions;
 /// // Set arrow options to skip encoding statistics for all columns, but to decode statistics
 /// // for columns 0 and 1.
 /// let options = ArrowReaderOptions::new()
 ///     .with_encoding_stats_policy(ParquetStatisticsPolicy::skip_except(&[0, 1]));
+/// # }
 /// ```
 #[derive(Default, Debug, Clone)]
 pub enum ParquetStatisticsPolicy {

@@ -16,9 +16,14 @@
 // under the License.
 
 use std::hint;
+use std::mem::{size_of, size_of_val};
+use std::sync::Arc;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parquet::bloom_filter::Sbbf;
+use parquet::file::metadata::{
+    BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterProvider, BloomFilterStatus,
+};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -219,6 +224,159 @@ fn bench_check(c: &mut Criterion) {
     group.finish();
 }
 
+// Outer `None` is NotLoaded, `Some(None)` is Absent, and `Some(Some(_))` is Present.
+type DenseBloomFilterEntry = Option<Option<Sbbf>>;
+
+struct DenseBloomFilterIndex {
+    num_columns: usize,
+    entries: Vec<DenseBloomFilterEntry>,
+}
+
+impl DenseBloomFilterIndex {
+    fn build(num_row_groups: usize, num_columns: usize, stride: usize, filter: &Sbbf) -> Self {
+        let len = num_row_groups.checked_mul(num_columns).unwrap();
+        let mut entries = vec![None; len];
+        for entry_idx in (0..len).step_by(stride) {
+            entries[entry_idx] = Some(Some(filter.clone()));
+        }
+        Self {
+            num_columns,
+            entries,
+        }
+    }
+
+    fn is_present(&self, row_group_idx: usize, column_idx: usize) -> bool {
+        let entry_idx = row_group_idx * self.num_columns + column_idx;
+        matches!(self.entries[entry_idx], Some(Some(_)))
+    }
+
+    fn memory_size(&self) -> usize {
+        size_of_val(self)
+            + self.entries.capacity() * size_of::<DenseBloomFilterEntry>()
+            + self
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    Some(Some(filter)) => filter.num_blocks() * 32,
+                    None | Some(None) => 0,
+                })
+                .sum::<usize>()
+    }
+}
+
+fn build_sparse_bloom_filter_index(
+    num_row_groups: usize,
+    num_columns: usize,
+    stride: usize,
+    filter: &Sbbf,
+) -> BloomFilterIndex {
+    let mut builder = BloomFilterIndexBuilder::try_new(num_row_groups, num_columns).unwrap();
+    let len = num_row_groups.checked_mul(num_columns).unwrap();
+    for entry_idx in (0..len).step_by(stride) {
+        builder
+            .put_filter(
+                filter.clone(),
+                entry_idx / num_columns,
+                entry_idx % num_columns,
+            )
+            .unwrap();
+    }
+    builder.try_build().unwrap()
+}
+
+/// Estimates the frozen sparse representation for an all-present workload. The estimate includes
+/// the sorted key/pointer array, one `Arc` allocation per entry, and each filter bitset. Allocator
+/// overhead is intentionally excluded, matching `ParquetMetaData::memory_size`.
+fn sparse_memory_size(index: &BloomFilterIndex) -> usize {
+    let entry_storage = size_of::<(u64, Arc<DenseBloomFilterEntry>)>();
+    let arc_allocation = 2 * size_of::<usize>() + size_of::<DenseBloomFilterEntry>();
+    size_of_val(index)
+        + index.len() * (entry_storage + arc_allocation)
+        + index
+            .iter()
+            .map(|(_, filter)| filter.num_blocks() * 32)
+            .sum::<usize>()
+}
+
+fn bench_bloom_filter_cache_storage(c: &mut Criterion) {
+    const NUM_ROW_GROUPS: usize = 128;
+    const NUM_COLUMNS: usize = 64;
+    const NUM_COORDINATES: usize = NUM_ROW_GROUPS * NUM_COLUMNS;
+
+    let filter = Sbbf::new_with_num_of_bytes(32);
+    for (coverage, stride) in [("sparse", 64), ("dense", 1)] {
+        let sparse = build_sparse_bloom_filter_index(NUM_ROW_GROUPS, NUM_COLUMNS, stride, &filter);
+        let dense = DenseBloomFilterIndex::build(NUM_ROW_GROUPS, NUM_COLUMNS, stride, &filter);
+
+        let mut memory = c.benchmark_group(format!("cache_memory/{coverage}"));
+        for (representation, bytes) in [
+            ("frozen_sparse", sparse_memory_size(&sparse)),
+            ("dense_vector", dense.memory_size()),
+        ] {
+            memory.bench_function(
+                BenchmarkId::new(representation, format!("{bytes}_bytes")),
+                |b| b.iter(|| hint::black_box(bytes)),
+            );
+        }
+        memory.finish();
+
+        let mut build = c.benchmark_group(format!("cache_build/{coverage}"));
+        build.throughput(Throughput::Elements((NUM_COORDINATES / stride) as u64));
+        build.bench_function("frozen_sparse", |b| {
+            b.iter(|| {
+                build_sparse_bloom_filter_index(
+                    NUM_ROW_GROUPS,
+                    NUM_COLUMNS,
+                    stride,
+                    hint::black_box(&filter),
+                )
+            })
+        });
+        build.bench_function("dense_vector", |b| {
+            b.iter(|| {
+                DenseBloomFilterIndex::build(
+                    NUM_ROW_GROUPS,
+                    NUM_COLUMNS,
+                    stride,
+                    hint::black_box(&filter),
+                )
+            })
+        });
+        build.finish();
+
+        let mut lookup = c.benchmark_group(format!("cache_lookup/{coverage}"));
+        lookup.throughput(Throughput::Elements(NUM_COORDINATES as u64));
+        lookup.bench_function("frozen_sparse", |b| {
+            b.iter(|| {
+                let mut present = 0;
+                for entry_idx in 0..NUM_COORDINATES {
+                    if matches!(
+                        sparse
+                            .status(entry_idx / NUM_COLUMNS, entry_idx % NUM_COLUMNS)
+                            .unwrap(),
+                        BloomFilterStatus::Present(_)
+                    ) {
+                        present += 1;
+                    }
+                }
+                hint::black_box(present)
+            })
+        });
+        lookup.bench_function("dense_vector", |b| {
+            b.iter(|| {
+                let mut present = 0;
+                for entry_idx in 0..NUM_COORDINATES {
+                    if dense.is_present(entry_idx / NUM_COLUMNS, entry_idx % NUM_COLUMNS) {
+                        present += 1;
+                    }
+                }
+                hint::black_box(present)
+            })
+        });
+        lookup.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_fold_to_target_fpp,
@@ -226,5 +384,6 @@ criterion_group!(
     bench_insert_only,
     bench_insert,
     bench_check,
+    bench_bloom_filter_cache_storage,
 );
 criterion_main!(benches);

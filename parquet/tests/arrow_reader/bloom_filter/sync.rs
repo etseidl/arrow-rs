@@ -116,7 +116,29 @@ fn test_cached_bloom_filter_status_controls_sync_io() {
             .unwrap()
             .is_some()
     );
-    assert!(input.request_count() > 0);
+    assert_eq!(input.request_count(), 1);
+}
+
+#[test]
+fn test_default_options_add_no_bloom_filter_io() {
+    let data = cached_bloom_filter_file();
+
+    let default_input = CountingChunkReader::new(data.clone());
+    let default_metadata =
+        ArrowReaderMetadata::load(&default_input, ArrowReaderOptions::new()).unwrap();
+    assert!(default_metadata.metadata().bloom_filters().is_none());
+
+    let explicit_skip_input = CountingChunkReader::new(data);
+    let explicit_skip_metadata = ArrowReaderMetadata::load(
+        &explicit_skip_input,
+        ArrowReaderOptions::new().with_bloom_filter_policy(BloomFilterPolicy::Skip),
+    )
+    .unwrap();
+    assert!(explicit_skip_metadata.metadata().bloom_filters().is_none());
+    assert_eq!(
+        default_input.request_count(),
+        explicit_skip_input.request_count()
+    );
 }
 
 #[test]
@@ -175,5 +197,5 @@ fn test_external_bloom_filter_cache_workflow() {
             .unwrap()
             .is_some()
     );
-    assert!(input.request_count() > 0);
+    assert_eq!(input.request_count(), 1);
 }

@@ -1514,6 +1514,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "arrow")]
     use crate::arrow::ArrowWriter;
+    #[cfg(feature = "arrow")]
     use crate::file::metadata::BloomFilterStatus;
     #[cfg(feature = "arrow")]
     use crate::file::properties::WriterProperties;
