@@ -504,6 +504,17 @@ pub(crate) fn decode_bloom_filter_bitset(
     info: &BloomFilterReadInfo,
     bitset: &[u8],
 ) -> Result<Sbbf, ParquetError> {
+    let expected_len = info
+        .bitset_range
+        .end
+        .checked_sub(info.bitset_range.start)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Invalid bloom filter bitset range: {:?}",
+                info.bitset_range
+            ))
+        })?;
     let expected_start = info
         .filter_offset
         .checked_add(info.header_len)
@@ -528,17 +539,6 @@ pub(crate) fn decode_bloom_filter_bitset(
             info.filter_offset
         )));
     }
-    let expected_len = info
-        .bitset_range
-        .end
-        .checked_sub(info.bitset_range.start)
-        .and_then(|len| usize::try_from(len).ok())
-        .ok_or_else(|| {
-            ParquetError::General(format!(
-                "Invalid bloom filter bitset range: {:?}",
-                info.bitset_range
-            ))
-        })?;
 
     if bitset.len() != expected_len {
         return Err(ParquetError::General(format!(
