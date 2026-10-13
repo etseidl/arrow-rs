@@ -239,10 +239,6 @@ pub struct RowGroupBloomFilters {
 
 impl RowGroupBloomFilters {
     /// Constructs an accessor for an already-validated row-group index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used when Bloom filters are attached in phase 3")
-    )]
     pub(crate) fn new(
         row_group_idx: usize,
         num_columns: usize,

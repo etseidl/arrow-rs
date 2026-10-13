@@ -118,6 +118,7 @@ pub(crate) use writer::ThriftMetadataWriter;
 /// * [`FileMetaData`]: Information about the overall file (such as the schema) (See [`Self::file_metadata`])
 /// * [`RowGroupMetaData`]: Information about each Row Group (see [`Self::row_groups`])
 /// * [`PageIndexProvider`]: Optional Page Index (see [`Self::page_index`])
+/// * [`BloomFilterProvider`]: Optional decoded Bloom filters (see [`Self::bloom_filters`])
 ///
 /// This structure is read by the various readers in this crate or can be read
 /// directly from a file using the [`ParquetMetaDataReader`] struct.
@@ -136,6 +137,8 @@ pub struct ParquetMetaData {
     row_groups: Arc<Vec<RowGroupMetaData>>,
     /// Page level index for each page in each column chunk
     page_index: Option<Arc<dyn PageIndexProvider>>,
+    /// Decoded Bloom filters for column chunks
+    bloom_filters: Option<Arc<dyn BloomFilterProvider>>,
     /// Optional file decryptor
     #[cfg(feature = "encryption")]
     file_decryptor: Option<Arc<FileDecryptor>>,
@@ -149,6 +152,7 @@ impl ParquetMetaData {
             file_metadata: Arc::new(file_metadata),
             row_groups: Arc::new(row_groups),
             page_index: None,
+            bloom_filters: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
         }
@@ -219,6 +223,31 @@ impl ParquetMetaData {
         RowGroupPageIndex::new(row_group_idx, self.page_index.clone())
     }
 
+    /// Returns the decoded Bloom filter provider attached to this metadata, if any.
+    pub fn bloom_filters(&self) -> Option<&Arc<dyn BloomFilterProvider>> {
+        self.bloom_filters.as_ref()
+    }
+
+    /// Returns a decoded Bloom filter accessor scoped to one row group.
+    ///
+    /// Returns an error if `row_group_idx` is outside this metadata's row groups.
+    pub fn bloom_filters_for_row_group(
+        &self,
+        row_group_idx: usize,
+    ) -> Result<RowGroupBloomFilters> {
+        let row_group = self.row_groups.get(row_group_idx).ok_or_else(|| {
+            ParquetError::General(format!(
+                "Bloom filter row group index out of bounds: {row_group_idx}; metadata has {} row groups",
+                self.num_row_groups()
+            ))
+        })?;
+        Ok(RowGroupBloomFilters::new(
+            row_group_idx,
+            row_group.num_columns(),
+            self.bloom_filters.clone(),
+        ))
+    }
+
     /// Estimate of the bytes allocated to store `ParquetMetadata`
     ///
     /// # Notes:
@@ -229,9 +258,9 @@ impl ParquetMetaData {
     ///    [`RowGroupMetaData`].
     ///
     /// 3. Includes memory from shared pointers (e.g. [`SchemaDescPtr`] and the
-    ///    [`Arc`] values in a [`PageIndex`]). This means `memory_size` will over
+    ///    [`Arc`] values in a [`PageIndex`] or [`BloomFilterIndex`]). This means `memory_size` will over
     ///    estimate the memory size if such pointers are shared, including when
-    ///    page indexes are also held in an external cache.
+    ///    indexes or filters are also held in an external cache.
     ///
     /// 4. Does not include any allocator overheads
     pub fn memory_size(&self) -> usize {
@@ -257,16 +286,40 @@ impl ParquetMetaData {
             0
         };
 
+        // As with PageIndex, custom providers cannot currently report their allocation size.
+        let bloom_filter_size = if let Some(bloom_filters) = self.bloom_filters.as_ref() {
+            if let Some(bloom_filters) = bloom_filters.as_any().downcast_ref::<BloomFilterIndex>() {
+                // Arc stores weak and strong counts on the heap alongside the provider.
+                2 * std::mem::size_of::<usize>()
+                    + std::mem::size_of::<BloomFilterIndex>()
+                    + bloom_filters.heap_size()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         std::mem::size_of::<Self>()
             + self.file_metadata.heap_size()
             + self.row_groups.heap_size()
             + page_index_size
+            + bloom_filter_size
             + encryption_size
     }
 
     /// Override the page index
     pub(crate) fn set_page_index(&mut self, index: Option<Arc<dyn PageIndexProvider>>) {
         self.page_index = index;
+    }
+
+    /// Override the decoded Bloom filter provider.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used when Bloom filters are loaded in phase 4")
+    )]
+    pub(crate) fn set_bloom_filters(&mut self, provider: Option<Arc<dyn BloomFilterProvider>>) {
+        self.bloom_filters = provider;
     }
 }
 
@@ -282,8 +335,8 @@ impl PartialEq for ParquetMetaData {
             return false;
         }
 
-        // Compare page_index by downcasting to PageIndex and comparing
-        match (&self.page_index, &other.page_index) {
+        // Compare default providers by value and custom providers by identity.
+        let page_indexes_equal = match (&self.page_index, &other.page_index) {
             (None, None) => true,
             (Some(a), Some(b)) => {
                 // Try to downcast both to PageIndex for comparison
@@ -292,6 +345,22 @@ impl PartialEq for ParquetMetaData {
                 match (a_page_index, b_page_index) {
                     (Some(a_idx), Some(b_idx)) => a_idx == b_idx,
                     _ => Arc::ptr_eq(a, b), // Fall back to pointer equality if not PageIndex
+                }
+            }
+            _ => false,
+        };
+        if !page_indexes_equal {
+            return false;
+        }
+
+        match (&self.bloom_filters, &other.bloom_filters) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let a_index = a.as_any().downcast_ref::<BloomFilterIndex>();
+                let b_index = b.as_any().downcast_ref::<BloomFilterIndex>();
+                match (a_index, b_index) {
+                    (Some(a_idx), Some(b_idx)) => a_idx == b_idx,
+                    _ => Arc::ptr_eq(a, b),
                 }
             }
             _ => false,
@@ -343,6 +412,8 @@ pub struct ParquetMetaDataBuilder {
     row_groups: Arc<Vec<RowGroupMetaData>>,
     /// Page level index for each page in each column chunk
     page_index: Option<Arc<dyn PageIndexProvider>>,
+    /// Decoded Bloom filters for column chunks
+    bloom_filters: Option<Arc<dyn BloomFilterProvider>>,
     /// Optional file decryptor
     #[cfg(feature = "encryption")]
     file_decryptor: Option<Arc<FileDecryptor>>,
@@ -355,6 +426,7 @@ impl ParquetMetaDataBuilder {
             file_metadata: Arc::new(file_meta_data),
             row_groups: Arc::new(vec![]),
             page_index: None,
+            bloom_filters: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
         }
@@ -366,6 +438,7 @@ impl ParquetMetaDataBuilder {
             file_metadata,
             row_groups,
             page_index,
+            bloom_filters,
             #[cfg(feature = "encryption")]
             file_decryptor,
         } = metadata;
@@ -373,18 +446,25 @@ impl ParquetMetaDataBuilder {
             file_metadata,
             row_groups,
             page_index,
+            bloom_filters,
             #[cfg(feature = "encryption")]
             file_decryptor,
         }
     }
 
-    /// Adds a row group to the metadata
+    /// Adds a row group to the metadata.
+    ///
+    /// Any attached page-index and Bloom-filter providers are retained. If this changes their
+    /// coordinate mapping, the caller must replace or remove both providers before building.
     pub fn add_row_group(mut self, row_group: RowGroupMetaData) -> Self {
         Arc::make_mut(&mut self.row_groups).push(row_group);
         self
     }
 
-    /// Sets all the row groups to the specified list
+    /// Sets all the row groups to the specified list.
+    ///
+    /// Any attached page-index and Bloom-filter providers are retained. If this changes their
+    /// coordinate mapping, the caller must replace or remove both providers before building.
     pub fn set_row_groups(mut self, row_groups: Vec<RowGroupMetaData>) -> Self {
         self.row_groups = Arc::new(row_groups);
         self
@@ -395,6 +475,9 @@ impl ParquetMetaDataBuilder {
     ///
     /// This can be used for more efficient creation of a new ParquetMetaData
     /// from an existing one.
+    ///
+    /// Any attached page-index and Bloom-filter providers are retained. The caller must replace
+    /// or remove both providers before building metadata with reordered or different row groups.
     pub fn take_row_groups(&mut self) -> Vec<RowGroupMetaData> {
         Arc::unwrap_or_clone(std::mem::take(&mut self.row_groups))
     }
@@ -427,6 +510,25 @@ impl ParquetMetaDataBuilder {
         self.page_index.as_ref().map(|arc| arc.as_ref())
     }
 
+    /// Sets the decoded [`BloomFilterProvider`].
+    pub fn set_bloom_filters(
+        mut self,
+        bloom_filters: Option<Arc<dyn BloomFilterProvider>>,
+    ) -> Self {
+        self.bloom_filters = bloom_filters;
+        self
+    }
+
+    /// Returns the decoded Bloom filter provider, replacing it with `None`.
+    pub fn take_bloom_filters(&mut self) -> Option<Arc<dyn BloomFilterProvider>> {
+        std::mem::take(&mut self.bloom_filters)
+    }
+
+    /// Returns the decoded Bloom filter provider currently attached to this builder.
+    pub fn bloom_filters(&self) -> Option<&dyn BloomFilterProvider> {
+        self.bloom_filters.as_deref()
+    }
+
     /// Sets the file decryptor needed to decrypt this metadata.
     #[cfg(feature = "encryption")]
     pub(crate) fn set_file_decryptor(mut self, file_decryptor: Option<FileDecryptor>) -> Self {
@@ -440,6 +542,7 @@ impl ParquetMetaDataBuilder {
             file_metadata: self.file_metadata,
             row_groups: self.row_groups,
             page_index: self.page_index,
+            bloom_filters: self.bloom_filters,
             #[cfg(feature = "encryption")]
             file_decryptor: self.file_decryptor,
         }
@@ -1773,6 +1876,7 @@ impl OffsetIndexBuilder {
 mod tests {
     use super::*;
     use crate::basic::{PageType, SortOrder};
+    use crate::bloom_filter::Sbbf;
     use crate::file::metadata::page_index::PageIndexBuilder;
     use crate::file::metadata::thrift::tests::{
         read_column_chunk, read_column_chunk_with_options, read_row_group,
@@ -2122,9 +2226,9 @@ mod tests {
 
         // Base size without page index
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2814;
+        let base_expected_size = 2830;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2982;
+        let base_expected_size = 2998;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2159,9 +2263,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3360;
+        let bigger_expected_size = 3376;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3528;
+        let bigger_expected_size = 3544;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2208,7 +2312,7 @@ mod tests {
             .set_row_groups(row_group_meta.clone())
             .build();
 
-        let base_expected_size = 2090;
+        let base_expected_size = 2106;
         assert_eq!(parquet_meta_data.memory_size(), base_expected_size);
 
         let footer_key = b"0123456789012345";
@@ -2234,7 +2338,7 @@ mod tests {
             .set_file_decryptor(Some(decryptor))
             .build();
 
-        let expected_size_with_decryptor = 3120;
+        let expected_size_with_decryptor = 3136;
         assert!(expected_size_with_decryptor > base_expected_size);
 
         assert_eq!(
@@ -2262,6 +2366,173 @@ mod tests {
             .unwrap();
 
         Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+    }
+
+    fn get_test_metadata() -> ParquetMetaData {
+        let schema = get_test_schema_descr();
+        let columns = schema
+            .columns()
+            .iter()
+            .map(|column| {
+                ColumnChunkMetaData::builder(column.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema))
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let file_metadata = FileMetaData::new(1, 0, None, None, schema, None);
+        ParquetMetaData::new(file_metadata, vec![row_group])
+    }
+
+    fn get_test_bloom_filter(seed: u8) -> Sbbf {
+        let mut bitset = vec![0; 32];
+        bitset[0] = seed;
+        Sbbf::try_from_bitset(&bitset).unwrap()
+    }
+
+    fn get_test_bloom_filter_index() -> BloomFilterIndex {
+        let mut builder = BloomFilterIndexBuilder::try_new(1, 2).unwrap();
+        builder
+            .put_filter(get_test_bloom_filter(1), 0, 0)
+            .unwrap()
+            .put_absent(0, 1)
+            .unwrap();
+        builder.try_build().unwrap()
+    }
+
+    #[derive(Debug)]
+    struct TestBloomFilterProvider;
+
+    impl BloomFilterProvider for TestBloomFilterProvider {
+        fn status(
+            &self,
+            _row_group_idx: usize,
+            _column_idx: usize,
+        ) -> Result<BloomFilterStatus<'_>> {
+            Ok(BloomFilterStatus::NotLoaded)
+        }
+
+        fn has_bloom_filters(&self) -> bool {
+            false
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_bloom_filter_provider_access_and_builder_round_trip() {
+        let provider: Arc<dyn BloomFilterProvider> = Arc::new(get_test_bloom_filter_index());
+        let metadata = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::clone(&provider)))
+            .build();
+
+        assert!(Arc::ptr_eq(metadata.bloom_filters().unwrap(), &provider));
+        let row_group = metadata.bloom_filters_for_row_group(0).unwrap();
+        assert!(matches!(
+            row_group.status(0).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
+        assert_eq!(row_group.status(1).unwrap(), BloomFilterStatus::Absent);
+        assert!(row_group.status(2).is_err());
+
+        let clone = metadata.clone();
+        assert!(Arc::ptr_eq(
+            clone.bloom_filters().unwrap(),
+            metadata.bloom_filters().unwrap()
+        ));
+
+        let mut builder = metadata.into_builder();
+        assert!(std::ptr::eq(
+            builder.bloom_filters().unwrap(),
+            provider.as_ref()
+        ));
+        let taken = builder.take_bloom_filters().unwrap();
+        assert!(Arc::ptr_eq(&taken, &provider));
+        assert!(builder.bloom_filters().is_none());
+        let rebuilt = builder.set_bloom_filters(Some(taken)).build();
+        assert!(Arc::ptr_eq(rebuilt.bloom_filters().unwrap(), &provider));
+    }
+
+    #[test]
+    fn test_bloom_filter_provider_equality() {
+        let left = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::new(get_test_bloom_filter_index())))
+            .build();
+        let right = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::new(get_test_bloom_filter_index())))
+            .build();
+        assert_eq!(left, right);
+
+        let custom: Arc<dyn BloomFilterProvider> = Arc::new(TestBloomFilterProvider);
+        let same_custom = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::clone(&custom)))
+            .build();
+        let same_custom_again = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(custom))
+            .build();
+        assert_eq!(same_custom, same_custom_again);
+
+        let different_custom = get_test_metadata()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::new(TestBloomFilterProvider)))
+            .build();
+        assert_ne!(same_custom, different_custom);
+    }
+
+    #[test]
+    fn test_bloom_filter_invalid_row_group_returns_error_without_panicking() {
+        let metadata = get_test_metadata();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            metadata.bloom_filters_for_row_group(1)
+        }));
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn test_row_group_mutation_retains_coordinate_providers() {
+        let bloom_filters: Arc<dyn BloomFilterProvider> = Arc::new(get_test_bloom_filter_index());
+        let page_index: Arc<dyn PageIndexProvider> = Arc::new(PageIndexBuilder::new(1, 2).build());
+        let builder = get_test_metadata()
+            .into_builder()
+            .set_page_index(Some(Arc::clone(&page_index)))
+            .set_bloom_filters(Some(Arc::clone(&bloom_filters)))
+            .set_row_groups(vec![]);
+
+        assert!(std::ptr::eq(
+            builder.page_index().unwrap(),
+            page_index.as_ref()
+        ));
+        assert!(std::ptr::eq(
+            builder.bloom_filters().unwrap(),
+            bloom_filters.as_ref()
+        ));
+    }
+
+    #[test]
+    fn test_bloom_filter_memory_size_and_internal_setter() {
+        let base = get_test_metadata();
+        let base_size = base.memory_size();
+        let index = Arc::new(get_test_bloom_filter_index());
+        let expected_provider_size = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<BloomFilterIndex>()
+            + index.as_ref().heap_size();
+        let provider: Arc<dyn BloomFilterProvider> = index;
+
+        let mut metadata = base.clone();
+        metadata.set_bloom_filters(Some(Arc::clone(&provider)));
+        assert_eq!(metadata.memory_size(), base_size + expected_provider_size);
+        metadata.set_bloom_filters(None);
+        assert_eq!(metadata.memory_size(), base_size);
     }
 
     #[test]
