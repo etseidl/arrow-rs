@@ -16,14 +16,20 @@
 // under the License.
 
 use crate::DecodeResult;
+use crate::bloom_filter::{
+    SBBF_HEADER_SIZE_ESTIMATE, bloom_filter_location, decode_bloom_filter_bitset,
+    decode_bloom_filter_header,
+};
 #[cfg(feature = "encryption")]
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::FOOTER_SIZE;
+use crate::file::metadata::bloom_filter::BloomFilterIndexBuilder;
 use crate::file::metadata::page_index::PageIndex;
 use crate::file::metadata::parser::{MetadataParser, parse_page_index};
 use crate::file::metadata::{
-    ColumnChunkMask, FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
+    BloomFilterIndex, BloomFilterPolicy, ColumnChunkMask, FooterTail, PageIndexPolicy,
+    ParquetMetaData, ParquetMetaDataOptions,
 };
 use crate::file::reader::ChunkReader;
 use bytes::Bytes;
@@ -232,6 +238,10 @@ pub struct ParquetMetaDataPushDecoder {
     column_index_mask: ColumnChunkMask,
     /// which rows and columns of the offset index should be read
     offset_index_mask: ColumnChunkMask,
+    /// policy for eagerly loading Bloom filters
+    bloom_filter_policy: BloomFilterPolicy,
+    /// selected Bloom-filter row groups and columns
+    bloom_filter_mask: ColumnChunkMask,
     /// Underlying buffers
     buffers: crate::util::push_buffers::PushBuffers,
     /// Encryption API
@@ -258,6 +268,8 @@ impl ParquetMetaDataPushDecoder {
             offset_index_policy: PageIndexPolicy::Optional,
             column_index_mask: ColumnChunkMask::all(),
             offset_index_mask: ColumnChunkMask::all(),
+            bloom_filter_policy: BloomFilterPolicy::Skip,
+            bloom_filter_mask: ColumnChunkMask::all(),
             buffers: crate::util::push_buffers::PushBuffers::new(file_len),
             metadata_parser: MetadataParser::new(),
         })
@@ -331,6 +343,20 @@ impl ParquetMetaDataPushDecoder {
     /// Select the row groups and columns for which offset indexes are read.
     pub fn with_offset_index_mask(mut self, mask: ColumnChunkMask) -> Self {
         self.offset_index_mask = mask;
+        self
+    }
+
+    /// Sets the policy for eagerly loading decoded Bloom filters. Defaults to
+    /// [`BloomFilterPolicy::Skip`].
+    pub fn with_bloom_filter_policy(mut self, policy: BloomFilterPolicy) -> Self {
+        self.bloom_filter_policy = policy;
+        self
+    }
+
+    /// Selects the row groups and leaf columns whose Bloom filters are loaded. By default, all
+    /// column chunks are selected.
+    pub fn with_bloom_filter_mask(mut self, mask: ColumnChunkMask) -> Self {
+        self.bloom_filter_mask = mask;
         self
     }
 
@@ -452,9 +478,31 @@ impl ParquetMetaDataPushDecoder {
                             } else {
                                 metadata.set_page_index(None);
                             }
-                            return Ok(DecodeResult::Data(*metadata));
+                            self.state = DecodeState::ReadingBloomFilters(metadata);
                         }
                         DecodeResult::Finished => return Ok(DecodeResult::Finished),
+                    }
+                }
+
+                DecodeState::ReadingBloomFilters(metadata) => {
+                    match self.decode_bloom_filters_for_metadata(&metadata) {
+                        Ok(DecodeResult::NeedsData(ranges)) => {
+                            self.state = DecodeState::ReadingBloomFilters(metadata);
+                            return Ok(DecodeResult::NeedsData(ranges));
+                        }
+                        Ok(DecodeResult::Data(bloom_filters)) => {
+                            let mut metadata = *metadata;
+                            if let Some(bloom_filters) = bloom_filters {
+                                metadata.set_bloom_filters(Some(Arc::new(bloom_filters)));
+                            }
+                            self.state = DecodeState::Finished;
+                            return Ok(DecodeResult::Data(metadata));
+                        }
+                        Ok(DecodeResult::Finished) => unreachable!(),
+                        Err(err) => {
+                            self.state = DecodeState::ReadingBloomFilters(metadata);
+                            return Err(err);
+                        }
                     }
                 }
 
@@ -518,6 +566,174 @@ impl ParquetMetaDataPushDecoder {
                 "ParquetMetaDataPushDecoder: internal error, invalid state"
             )),
         }
+    }
+
+    /// Tries to decode selected Bloom filters from pushed data.
+    ///
+    /// The returned metadata retains any provider already attached to it. The newly decoded
+    /// default cache is returned separately so callers may attach it or store it externally.
+    pub fn try_decode_bloom_filters(
+        &mut self,
+    ) -> Result<DecodeResult<(ParquetMetaData, Option<BloomFilterIndex>)>> {
+        match std::mem::replace(&mut self.state, DecodeState::Intermediate) {
+            DecodeState::ReadingPageIndex(metadata)
+            | DecodeState::ReadingBloomFilters(metadata) => {
+                match self.decode_bloom_filters_for_metadata(&metadata) {
+                    Ok(DecodeResult::NeedsData(ranges)) => {
+                        self.state = DecodeState::ReadingBloomFilters(metadata);
+                        Ok(DecodeResult::NeedsData(ranges))
+                    }
+                    Ok(DecodeResult::Data(bloom_filters)) => {
+                        self.state = DecodeState::Finished;
+                        Ok(DecodeResult::Data((*metadata, bloom_filters)))
+                    }
+                    Ok(DecodeResult::Finished) => unreachable!(),
+                    Err(err) => {
+                        self.state = DecodeState::ReadingBloomFilters(metadata);
+                        Err(err)
+                    }
+                }
+            }
+            DecodeState::Finished => Ok(DecodeResult::Finished),
+            state => {
+                self.state = state;
+                Err(general_err!(
+                    "ParquetMetaDataPushDecoder: Bloom filters require decoded metadata"
+                ))
+            }
+        }
+    }
+
+    fn decode_bloom_filters_for_metadata(
+        &self,
+        metadata: &ParquetMetaData,
+    ) -> Result<DecodeResult<Option<BloomFilterIndex>>> {
+        if self.bloom_filter_policy == BloomFilterPolicy::Skip {
+            return Ok(DecodeResult::Data(None));
+        }
+
+        let num_row_groups = metadata.num_row_groups();
+        let num_columns = metadata
+            .row_groups()
+            .iter()
+            .map(|row_group| row_group.num_columns())
+            .max()
+            .unwrap_or_default();
+        let mut selected = false;
+        let mut missing = Vec::new();
+
+        // First round: known lengths request the complete filter; unknown lengths request enough
+        // bytes to decode the Thrift header. Ranges remain disjoint and are not widened across
+        // intervening column data.
+        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+            let row_group = metadata.row_group(row_group_idx);
+            for column_idx in self
+                .bloom_filter_mask
+                .column_indices(row_group.num_columns())
+            {
+                selected = true;
+                let column = row_group.column(column_idx);
+                let Some((offset, total_len)) = bloom_filter_location(column)? else {
+                    continue;
+                };
+                let initial_len = total_len.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE);
+                let end = offset.checked_add(u64::try_from(initial_len)?).ok_or_else(|| {
+                    general_err!(
+                        "Bloom filter range overflow at row group {row_group_idx}, column {column_idx}"
+                    )
+                })?;
+                let range = offset..end;
+                self.validate_bloom_filter_range(&range, row_group_idx, column_idx)?;
+                if !self.buffers.has_range(&range) {
+                    missing.push(range);
+                }
+            }
+        }
+
+        if !selected {
+            return Ok(DecodeResult::Data(None));
+        }
+        if !missing.is_empty() {
+            deduplicate_ranges(&mut missing);
+            return Ok(DecodeResult::NeedsData(missing));
+        }
+
+        // Second round: headers without an advertised total length reveal the exact bitset range.
+        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+            let row_group = metadata.row_group(row_group_idx);
+            for column_idx in self
+                .bloom_filter_mask
+                .column_indices(row_group.num_columns())
+            {
+                let column = row_group.column(column_idx);
+                let Some((offset, total_len)) = bloom_filter_location(column)? else {
+                    continue;
+                };
+                let initial_len = total_len.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE);
+                let initial_end =
+                    offset
+                        .checked_add(u64::try_from(initial_len)?)
+                        .ok_or_else(|| {
+                            general_err!("Bloom filter initial range overflow at offset {offset}")
+                        })?;
+                let header_bytes = self.get_bytes(&(offset..initial_end))?;
+                let info = decode_bloom_filter_header(offset, header_bytes, total_len)?;
+                self.validate_bloom_filter_range(&info.bitset_range, row_group_idx, column_idx)?;
+                if !self.buffers.has_range(&info.bitset_range) {
+                    missing.push(info.bitset_range);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            deduplicate_ranges(&mut missing);
+            return Ok(DecodeResult::NeedsData(missing));
+        }
+
+        let mut builder = BloomFilterIndexBuilder::try_new(num_row_groups, num_columns)?;
+        for row_group_idx in self.bloom_filter_mask.row_group_indices(num_row_groups) {
+            let row_group = metadata.row_group(row_group_idx);
+            for column_idx in self
+                .bloom_filter_mask
+                .column_indices(row_group.num_columns())
+            {
+                let column = row_group.column(column_idx);
+                let Some((offset, total_len)) = bloom_filter_location(column)? else {
+                    builder.put_absent(row_group_idx, column_idx)?;
+                    continue;
+                };
+                let initial_len = total_len.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE);
+                let initial_end =
+                    offset
+                        .checked_add(u64::try_from(initial_len)?)
+                        .ok_or_else(|| {
+                            general_err!("Bloom filter initial range overflow at offset {offset}")
+                        })?;
+                let info = decode_bloom_filter_header(
+                    offset,
+                    self.get_bytes(&(offset..initial_end))?,
+                    total_len,
+                )?;
+                let bitset = self.get_bytes(&info.bitset_range)?;
+                let filter = decode_bloom_filter_bitset(&info, &bitset)?;
+                builder.put_filter(filter, row_group_idx, column_idx)?;
+            }
+        }
+        Ok(DecodeResult::Data(Some(builder.try_build()?)))
+    }
+
+    fn validate_bloom_filter_range(
+        &self,
+        range: &Range<u64>,
+        row_group_idx: usize,
+        column_idx: usize,
+    ) -> Result<()> {
+        if range.end > self.buffers.file_len() {
+            return Err(eof_err!(
+                "Bloom filter range {range:?} for row group {row_group_idx}, column {column_idx} exceeds file length {}",
+                self.buffers.file_len()
+            ));
+        }
+        Ok(())
     }
 
     fn try_decode_page_index_for_metadata(
@@ -584,11 +800,18 @@ enum DecodeState {
     ReadingMetadata(FooterTail),
     // Actively reading the page index
     ReadingPageIndex(Box<ParquetMetaData>),
+    // Actively reading Bloom filters
+    ReadingBloomFilters(Box<ParquetMetaData>),
     // Decoding is complete
     Finished,
     /// State left during the `try_decode` method so something valid is present.
     /// This state should never be observed.
     Intermediate,
+}
+
+fn deduplicate_ranges(ranges: &mut Vec<Range<u64>>) {
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    ranges.dedup_by_key(|range| (range.start, range.end));
 }
 
 /// Returns the byte range needed to read the offset/page indexes, based on the
@@ -636,6 +859,7 @@ pub(crate) fn range_for_page_index(
 mod tests {
     use super::*;
     use crate::arrow::ArrowWriter;
+    use crate::file::metadata::bloom_filter::BloomFilterProvider;
     use crate::file::metadata::page_index::PageIndexProvider;
     use crate::file::properties::WriterProperties;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
@@ -746,6 +970,136 @@ mod tests {
         let mut decoder = ParquetMetaDataPushDecoder::try_new(test_file_len()).unwrap();
         let err = decoder.try_decode_page_index().unwrap_err();
         assert!(err.to_string().contains("invalid state"));
+    }
+
+    #[test]
+    fn test_bloom_filter_decoder_known_lengths_and_mask() {
+        let mut metadata = test_metadata_without_page_index();
+        let row_groups = Arc::make_mut(&mut metadata.row_groups);
+        let column = row_groups[1].columns_mut()[1].clone();
+        row_groups[1].columns_mut()[1] = column
+            .into_builder()
+            .set_bloom_filter_offset(None)
+            .set_bloom_filter_length(None)
+            .build()
+            .unwrap();
+        let mut decoder =
+            ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
+                .unwrap()
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([1], [0, 1]));
+
+        let ranges = expect_needs_data(decoder.try_decode_bloom_filters());
+        assert_eq!(ranges.len(), 1, "only column a has a filter");
+        push_ranges_to_metadata_decoder(&mut decoder, ranges);
+        let (_, index) = expect_data(decoder.try_decode_bloom_filters());
+        let index = index.unwrap();
+        assert!(matches!(
+            index.status(1, 0).unwrap(),
+            crate::file::metadata::BloomFilterStatus::Present(_)
+        ));
+        assert_eq!(
+            index.status(1, 1).unwrap(),
+            crate::file::metadata::BloomFilterStatus::Absent
+        );
+        assert_eq!(
+            index.status(0, 0).unwrap(),
+            crate::file::metadata::BloomFilterStatus::NotLoaded
+        );
+    }
+
+    #[test]
+    fn test_bloom_filter_decoder_unknown_length_uses_two_rounds() {
+        let mut metadata = test_metadata_without_page_index();
+        let row_groups = Arc::make_mut(&mut metadata.row_groups);
+        let column = row_groups[0].columns_mut()[0].clone();
+        row_groups[0].columns_mut()[0] = column
+            .into_builder()
+            .set_bloom_filter_length(None)
+            .build()
+            .unwrap();
+        let mut decoder =
+            ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
+                .unwrap()
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([0], [0]));
+
+        let header_ranges = expect_needs_data(decoder.try_decode_bloom_filters());
+        assert_eq!(header_ranges.len(), 1);
+        assert_eq!(
+            header_ranges[0].end - header_ranges[0].start,
+            SBBF_HEADER_SIZE_ESTIMATE as u64
+        );
+        push_ranges_to_metadata_decoder(&mut decoder, header_ranges);
+        let bitset_ranges = expect_needs_data(decoder.try_decode_bloom_filters());
+        assert_eq!(bitset_ranges.len(), 1);
+        assert!(bitset_ranges[0].end - bitset_ranges[0].start >= 32);
+        push_ranges_to_metadata_decoder(&mut decoder, bitset_ranges);
+        assert!(expect_data(decoder.try_decode_bloom_filters()).1.is_some());
+    }
+
+    #[test]
+    fn test_bloom_filter_optional_propagates_corruption_and_preserves_state() {
+        let mut metadata = test_metadata_without_page_index();
+        let row_groups = Arc::make_mut(&mut metadata.row_groups);
+        let column = row_groups[0].columns_mut()[0].clone();
+        row_groups[0].columns_mut()[0] = column
+            .into_builder()
+            .set_bloom_filter_length(Some(1))
+            .build()
+            .unwrap();
+        let mut decoder =
+            ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
+                .unwrap()
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+                .with_bloom_filter_mask(ColumnChunkMask::row_groups_and_columns([0], [0]));
+        let ranges = expect_needs_data(decoder.try_decode_bloom_filters());
+        push_ranges_to_metadata_decoder(&mut decoder, ranges);
+
+        let first = decoder.try_decode_bloom_filters().unwrap_err().to_string();
+        let second = decoder.try_decode_bloom_filters().unwrap_err().to_string();
+        assert_eq!(first, second);
+        assert!(first.contains("bloom filter header"));
+    }
+
+    #[test]
+    fn test_bloom_filter_skip_and_empty_mask_preserve_metadata_provider() {
+        let mut builder = BloomFilterIndexBuilder::try_new(2, 3).unwrap();
+        builder.put_absent(0, 0).unwrap();
+        let provider: Arc<dyn BloomFilterProvider> = Arc::new(builder.try_build().unwrap());
+        for mask in [ColumnChunkMask::all(), ColumnChunkMask::none()] {
+            let metadata = test_metadata_without_page_index()
+                .into_builder()
+                .set_bloom_filters(Some(Arc::clone(&provider)))
+                .build();
+            let mut decoder =
+                ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
+                    .unwrap()
+                    .with_bloom_filter_policy(if mask.is_all() {
+                        BloomFilterPolicy::Skip
+                    } else {
+                        BloomFilterPolicy::Optional
+                    })
+                    .with_bloom_filter_mask(mask);
+            let (metadata, index) = expect_data(decoder.try_decode_bloom_filters());
+            assert!(index.is_none());
+            assert!(Arc::ptr_eq(metadata.bloom_filters().unwrap(), &provider));
+        }
+    }
+
+    #[test]
+    fn test_normal_decode_attaches_bloom_filters() {
+        let mut decoder = ParquetMetaDataPushDecoder::try_new(test_file_len())
+            .unwrap()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional);
+        push_ranges_to_metadata_decoder(&mut decoder, vec![test_file_range()]);
+        let metadata = expect_data(decoder.try_decode());
+        let filters = metadata.bloom_filters().unwrap();
+        assert!(filters.has_bloom_filters());
+        assert!(matches!(
+            filters.status(0, 1).unwrap(),
+            crate::file::metadata::BloomFilterStatus::Present(_)
+        ));
     }
 
     /// It is possible to feed some, but not all, of the footer into the metadata decoder
@@ -893,6 +1247,7 @@ mod tests {
         let writer_options = WriterProperties::builder()
             .set_max_row_group_row_count(Some(200))
             .set_data_page_row_count_limit(100)
+            .set_bloom_filter_enabled(true)
             .build();
         let mut writer =
             ArrowWriter::try_new(&mut output, input_batch.schema(), Some(writer_options)).unwrap();

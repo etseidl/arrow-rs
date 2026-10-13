@@ -101,7 +101,7 @@ pub use bloom_filter::{
 pub use footer_tail::FooterTail;
 pub use options::{ParquetMetaDataOptions, ParquetStatisticsPolicy};
 pub use push_decoder::ParquetMetaDataPushDecoder;
-pub use reader::{ColumnChunkMask, PageIndexPolicy, ParquetMetaDataReader};
+pub use reader::{BloomFilterPolicy, ColumnChunkMask, PageIndexPolicy, ParquetMetaDataReader};
 use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
@@ -314,10 +314,6 @@ impl ParquetMetaData {
     }
 
     /// Override the decoded Bloom filter provider.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used when Bloom filters are loaded in phase 4")
-    )]
     pub(crate) fn set_bloom_filters(&mut self, provider: Option<Arc<dyn BloomFilterProvider>>) {
         self.bloom_filters = provider;
     }

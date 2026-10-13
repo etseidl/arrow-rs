@@ -27,7 +27,8 @@ use crate::file::metadata::page_index::{PageIndex, PageIndexProvider};
 use crate::file::metadata::parser::decode_metadata;
 use crate::file::metadata::thrift::parquet_schema_from_bytes;
 use crate::file::metadata::{
-    FooterTail, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataPushDecoder,
+    BloomFilterIndex, BloomFilterProvider, FooterTail, ParquetMetaData, ParquetMetaDataOptions,
+    ParquetMetaDataPushDecoder,
 };
 use crate::file::reader::ChunkReader;
 use crate::schema::types::SchemaDescriptor;
@@ -61,8 +62,9 @@ use crate::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
 /// See [`crate::file::metadata::ParquetMetaDataWriter#output-format`] for more details of
 /// Parquet metadata.
 ///
-/// This reader handles reading the footer as well as the non contiguous parts
-/// of the metadata (`PageIndex` and `ColumnIndex`). It does not handle reading Bloom Filters.
+/// This reader handles reading the footer as well as the non-contiguous parts
+/// of the metadata (page indexes and Bloom filters). Bloom-filter loading is opt-in with
+/// [`BloomFilterPolicy::Optional`].
 ///
 /// # Example
 /// ```no_run
@@ -83,6 +85,8 @@ pub struct ParquetMetaDataReader {
     offset_index: PageIndexPolicy,
     column_index_mask: ColumnChunkMask,
     offset_index_mask: ColumnChunkMask,
+    bloom_filter_policy: BloomFilterPolicy,
+    bloom_filter_mask: ColumnChunkMask,
     prefetch_hint: Option<usize>,
     metadata_options: Option<Arc<ParquetMetaDataOptions>>,
     // Size of the serialized thrift metadata plus the 8 byte footer. Only set if
@@ -111,6 +115,18 @@ pub enum PageIndexPolicy {
     /// enforced for the offset index; this is the same as [`Self::Optional`] for the
     /// column index.
     Required,
+}
+
+/// Describes the policy for eagerly loading decoded Bloom filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BloomFilterPolicy {
+    /// Do not load Bloom filters. Any provider already attached to metadata is preserved.
+    #[default]
+    Skip,
+    /// Load selected Bloom filters, recording missing filters as known absences.
+    ///
+    /// Corrupt filters advertised by the footer still produce an error.
+    Optional,
 }
 
 impl From<bool> for PageIndexPolicy {
@@ -399,6 +415,20 @@ impl ParquetMetaDataReader {
         self
     }
 
+    /// Sets the policy for eagerly loading decoded Bloom filters. Defaults to
+    /// [`BloomFilterPolicy::Skip`].
+    pub fn with_bloom_filter_policy(mut self, policy: BloomFilterPolicy) -> Self {
+        self.bloom_filter_policy = policy;
+        self
+    }
+
+    /// Selects the row groups and leaf columns whose Bloom filters are loaded. By default, all
+    /// column chunks are selected.
+    pub fn with_bloom_filter_mask(mut self, mask: ColumnChunkMask) -> Self {
+        self.bloom_filter_mask = mask;
+        self
+    }
+
     /// Sets the [`ParquetMetaDataOptions`] to use when decoding
     pub fn with_metadata_options(mut self, options: Option<ParquetMetaDataOptions>) -> Self {
         self.metadata_options = options.map(Arc::new);
@@ -410,8 +440,8 @@ impl ParquetMetaDataReader {
     ///
     /// By default, the reader will first fetch the last 8 bytes of the input file to obtain the
     /// size of the footer metadata. A second fetch will be performed to obtain the needed bytes.
-    /// After parsing the footer metadata, a third fetch will be performed to obtain the bytes
-    /// needed to decode the page index structures, if they have been requested. To avoid
+    /// After parsing the footer metadata, subsequent fetches obtain the bytes needed to decode
+    /// the requested page index and Bloom filter structures. To avoid
     /// unnecessary fetches, `prefetch` can be set to an estimate of the number of bytes needed
     /// to fully decode the [`ParquetMetaData`], which can reduce the number of fetch requests and
     /// reduce latency. Setting `prefetch` too small will not trigger an error, but will result
@@ -569,13 +599,15 @@ impl ParquetMetaDataReader {
             Err(e) => return Err(e),
         };
 
-        // we can return if page indexes aren't requested
-        if self.column_index == PageIndexPolicy::Skip && self.offset_index == PageIndexPolicy::Skip
+        if self.column_index != PageIndexPolicy::Skip || self.offset_index != PageIndexPolicy::Skip
         {
-            return Ok(());
+            self.read_page_indexes_sized(reader, file_size)?;
         }
 
-        self.read_page_indexes_sized(reader, file_size)
+        if self.bloom_filter_policy != BloomFilterPolicy::Skip {
+            self.read_bloom_filters_sized(reader, file_size)?;
+        }
+        Ok(())
     }
 
     /// Read the page index structures when a [`ParquetMetaData`] has already been obtained.
@@ -696,6 +728,96 @@ impl ParquetMetaDataReader {
         Ok(())
     }
 
+    /// Eagerly loads selected Bloom filters and attaches the resulting cache to the metadata.
+    ///
+    /// [`BloomFilterPolicy::Skip`] performs no I/O and preserves any attached provider.
+    pub fn read_bloom_filters<R: ChunkReader>(&mut self, reader: &R) -> Result<()> {
+        self.read_bloom_filters_sized(reader, reader.len())
+    }
+
+    /// Eagerly loads selected Bloom filters and returns them separately from the metadata.
+    ///
+    /// Any provider already attached to the returned metadata is left unchanged.
+    pub fn read_bloom_filter_and_finish<R: ChunkReader>(
+        self,
+        reader: &R,
+    ) -> Result<(ParquetMetaData, Option<BloomFilterIndex>)> {
+        self.read_bloom_filter_sized_impl(reader, reader.len())
+    }
+
+    fn read_bloom_filters_sized<R: ChunkReader>(
+        &mut self,
+        reader: &R,
+        file_size: u64,
+    ) -> Result<()> {
+        let (mut metadata, bloom_filters) = self.read_bloom_filter_sized_impl(reader, file_size)?;
+        if let Some(bloom_filters) = bloom_filters {
+            metadata
+                .set_bloom_filters(Some(Arc::new(bloom_filters) as Arc<dyn BloomFilterProvider>));
+        }
+        self.metadata = Some(metadata);
+        Ok(())
+    }
+
+    fn read_bloom_filter_sized_impl<R: ChunkReader>(
+        &self,
+        reader: &R,
+        file_size: u64,
+    ) -> Result<(ParquetMetaData, Option<BloomFilterIndex>)> {
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| general_err!("Tried to read Bloom filters without footer metadata"))?
+            .clone();
+        let decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
+            .with_bloom_filter_policy(self.bloom_filter_policy)
+            .with_bloom_filter_mask(self.bloom_filter_mask.clone())
+            .with_metadata_options(self.metadata_options.clone());
+        let mut decoder = self.prepare_push_decoder(decoder);
+        let file_range = file_size.saturating_sub(reader.len())..file_size;
+
+        loop {
+            match decoder.try_decode_bloom_filters()? {
+                DecodeResult::NeedsData(ranges) => {
+                    let mut buffers = Vec::new();
+                    buffers.try_reserve_exact(ranges.len()).map_err(|err| {
+                        general_err!(
+                            "failed to allocate buffers for {} Bloom filter ranges: {err}",
+                            ranges.len()
+                        )
+                    })?;
+                    for range in &ranges {
+                        if range.end > file_size {
+                            return Err(eof_err!(
+                                "Bloom filter range {range:?} exceeds file length {file_size}"
+                            ));
+                        }
+                        if range.start < file_range.start || range.end > file_range.end {
+                            return Err(ParquetError::NeedMoreData(usize::try_from(
+                                file_size - range.start,
+                            )?));
+                        }
+                        if let Some(metadata_size) = self.metadata_size {
+                            let metadata_start = file_size.saturating_sub(metadata_size as u64);
+                            if range.end > metadata_start {
+                                return Err(eof_err!(
+                                    "Bloom filter range {range:?} overlaps file metadata starting at {metadata_start}"
+                                ));
+                            }
+                        }
+                        let len = usize::try_from(range.end - range.start)?;
+                        buffers.push(reader.get_bytes(range.start - file_range.start, len)?);
+                    }
+                    decoder.push_ranges(ranges, buffers)?;
+                }
+                DecodeResult::Data(result) => return Ok(result),
+                DecodeResult::Finished => {
+                    return Err(general_err!("Bloom filter decoder was already finished"));
+                }
+            }
+        }
+    }
+
     /// Given a [`MetadataFetch`], parse and return the [`ParquetMetaData`] in a single pass.
     ///
     /// This call will consume `self`.
@@ -703,7 +825,7 @@ impl ParquetMetaDataReader {
     /// See [`Self::with_prefetch_hint`] for a discussion of how to reduce the number of fetches
     /// performed by this function.
     #[cfg(all(feature = "async", feature = "arrow"))]
-    pub async fn load_and_finish<F: MetadataFetch>(
+    pub async fn load_and_finish<F: MetadataFetch + Send>(
         mut self,
         fetch: F,
         file_size: u64,
@@ -719,7 +841,7 @@ impl ParquetMetaDataReader {
     /// See [`Self::with_prefetch_hint`] for a discussion of how to reduce the number of fetches
     /// performed by this function.
     #[cfg(all(feature = "async", feature = "arrow"))]
-    pub async fn load_via_suffix_and_finish<F: MetadataSuffixFetch>(
+    pub async fn load_via_suffix_and_finish<F: MetadataSuffixFetch + Send>(
         mut self,
         fetch: F,
     ) -> Result<ParquetMetaData> {
@@ -732,18 +854,26 @@ impl ParquetMetaDataReader {
     /// See [`Self::with_prefetch_hint`] for a discussion of how to reduce the number of fetches
     /// performed by this function.
     #[cfg(all(feature = "async", feature = "arrow"))]
-    pub async fn try_load<F: MetadataFetch>(&mut self, mut fetch: F, file_size: u64) -> Result<()> {
+    pub async fn try_load<F: MetadataFetch + Send>(
+        &mut self,
+        mut fetch: F,
+        file_size: u64,
+    ) -> Result<()> {
         let (metadata, remainder) = self.load_metadata(&mut fetch, file_size).await?;
 
         self.metadata = Some(metadata);
 
-        // we can return if page indexes aren't requested
-        if self.column_index == PageIndexPolicy::Skip && self.offset_index == PageIndexPolicy::Skip
+        if self.column_index != PageIndexPolicy::Skip || self.offset_index != PageIndexPolicy::Skip
         {
-            return Ok(());
+            self.load_page_index_with_remainder(&mut fetch, remainder.clone())
+                .await?;
         }
 
-        self.load_page_index_with_remainder(fetch, remainder).await
+        if self.bloom_filter_policy != BloomFilterPolicy::Skip {
+            self.load_bloom_filter_with_remainder(&mut fetch, remainder, file_size)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Attempts to (asynchronously) parse the footer metadata (and optionally page indexes)
@@ -752,7 +882,7 @@ impl ParquetMetaDataReader {
     /// See [`Self::with_prefetch_hint`] for a discussion of how to reduce the number of fetches
     /// performed by this function.
     #[cfg(all(feature = "async", feature = "arrow"))]
-    pub async fn try_load_via_suffix<F: MetadataSuffixFetch>(
+    pub async fn try_load_via_suffix<F: MetadataSuffixFetch + Send>(
         &mut self,
         mut fetch: F,
     ) -> Result<()> {
@@ -760,13 +890,17 @@ impl ParquetMetaDataReader {
 
         self.metadata = Some(metadata);
 
-        // we can return if page indexes aren't requested
-        if self.column_index == PageIndexPolicy::Skip && self.offset_index == PageIndexPolicy::Skip
+        if self.column_index != PageIndexPolicy::Skip || self.offset_index != PageIndexPolicy::Skip
         {
-            return Ok(());
+            self.load_page_index_with_remainder(&mut fetch, None)
+                .await?;
         }
 
-        self.load_page_index_with_remainder(fetch, None).await
+        if self.bloom_filter_policy != BloomFilterPolicy::Skip {
+            self.load_bloom_filter_with_remainder(&mut fetch, None, u64::MAX)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Asynchronously fetch the page index structures when a [`ParquetMetaData`] has already
@@ -776,7 +910,8 @@ impl ParquetMetaDataReader {
     /// multiple calls.
     #[cfg(all(feature = "async", feature = "arrow"))]
     pub async fn load_page_index<F: MetadataFetch>(&mut self, fetch: F) -> Result<()> {
-        self.load_page_index_with_remainder(fetch, None).await
+        let mut fetch = fetch;
+        self.load_page_index_with_remainder(&mut fetch, None).await
     }
 
     /// Asynchronously loads the page index structures described by the stored [`ParquetMetaData`],
@@ -789,10 +924,33 @@ impl ParquetMetaDataReader {
     /// first tuple element.
     #[cfg(all(feature = "async", feature = "arrow"))]
     pub async fn load_page_index_and_finish<F: MetadataFetch>(
-        mut self,
-        fetch: F,
+        self,
+        mut fetch: F,
     ) -> Result<(ParquetMetaData, Option<PageIndex>)> {
-        self.load_page_index_with_remainder_impl(fetch, None).await
+        self.load_page_index_with_remainder_impl(&mut fetch, None)
+            .await
+    }
+
+    /// Asynchronously loads selected Bloom filters and attaches the resulting cache.
+    #[cfg(all(feature = "async", feature = "arrow"))]
+    pub async fn load_bloom_filters<F: MetadataFetch + Send>(
+        &mut self,
+        mut fetch: F,
+    ) -> Result<()> {
+        self.load_bloom_filter_with_remainder(&mut fetch, None, u64::MAX)
+            .await
+    }
+
+    /// Asynchronously loads selected Bloom filters and returns them separately.
+    ///
+    /// Any provider already attached to the returned metadata is unchanged.
+    #[cfg(all(feature = "async", feature = "arrow"))]
+    pub async fn load_bloom_filter_and_finish<F: MetadataFetch + Send>(
+        self,
+        mut fetch: F,
+    ) -> Result<(ParquetMetaData, Option<BloomFilterIndex>)> {
+        self.load_bloom_filter_with_remainder_impl(&mut fetch, None, u64::MAX)
+            .await
     }
 
     /// Reads and decodes the dictionary page of a column chunk into an Arrow array.
@@ -845,7 +1003,7 @@ impl ParquetMetaDataReader {
     #[cfg(all(feature = "async", feature = "arrow"))]
     async fn load_page_index_with_remainder<F: MetadataFetch>(
         &mut self,
-        fetch: F,
+        fetch: &mut F,
         remainder: Option<(usize, Bytes)>,
     ) -> Result<()> {
         let (mut metadata, page_index) = self
@@ -859,13 +1017,15 @@ impl ParquetMetaDataReader {
 
     #[cfg(all(feature = "async", feature = "arrow"))]
     async fn load_page_index_with_remainder_impl<F: MetadataFetch>(
-        &mut self,
-        mut fetch: F,
+        &self,
+        fetch: &mut F,
         remainder: Option<(usize, Bytes)>,
     ) -> Result<(ParquetMetaData, Option<PageIndex>)> {
-        let Some(metadata) = self.metadata.take() else {
-            return Err(general_err!("Footer metadata is not present"));
-        };
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| general_err!("Footer metadata is not present"))?
+            .clone();
 
         // in this case we don't actually know what the file size is, so just use u64::MAX
         // this is ok since the offsets in the metadata are always valid
@@ -912,6 +1072,65 @@ impl ParquetMetaDataReader {
         }
         push_decoder.push_range(range.clone(), bytes)?;
         parse_page_index_data(&mut push_decoder)
+    }
+
+    #[cfg(all(feature = "async", feature = "arrow"))]
+    async fn load_bloom_filter_with_remainder<F: MetadataFetch + Send>(
+        &mut self,
+        fetch: &mut F,
+        remainder: Option<(usize, Bytes)>,
+        file_size: u64,
+    ) -> Result<()> {
+        let (mut metadata, bloom_filters) = self
+            .load_bloom_filter_with_remainder_impl(fetch, remainder, file_size)
+            .await?;
+        if let Some(bloom_filters) = bloom_filters {
+            metadata
+                .set_bloom_filters(Some(Arc::new(bloom_filters) as Arc<dyn BloomFilterProvider>));
+        }
+        self.metadata = Some(metadata);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "async", feature = "arrow"))]
+    async fn load_bloom_filter_with_remainder_impl<F: MetadataFetch + Send>(
+        &self,
+        fetch: &mut F,
+        remainder: Option<(usize, Bytes)>,
+        file_size: u64,
+    ) -> Result<(ParquetMetaData, Option<BloomFilterIndex>)> {
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| general_err!("Footer metadata is not present"))?
+            .clone();
+        let decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(file_size, metadata)?
+            .with_bloom_filter_policy(self.bloom_filter_policy)
+            .with_bloom_filter_mask(self.bloom_filter_mask.clone())
+            .with_metadata_options(self.metadata_options.clone());
+        let mut decoder = self.prepare_push_decoder(decoder);
+        if let Some((start, bytes)) = remainder {
+            let start = u64::try_from(start)?;
+            let end = start
+                .checked_add(u64::try_from(bytes.len())?)
+                .ok_or_else(|| {
+                    general_err!("prefetched metadata remainder range overflow at {start}")
+                })?;
+            decoder.push_range(start..end, bytes)?;
+        }
+
+        loop {
+            match decoder.try_decode_bloom_filters()? {
+                DecodeResult::NeedsData(ranges) => {
+                    let buffers = fetch.fetch_ranges(ranges.clone()).await?;
+                    decoder.push_ranges(ranges, buffers)?;
+                }
+                DecodeResult::Data(result) => return Ok(result),
+                DecodeResult::Finished => {
+                    return Err(general_err!("Bloom filter decoder was already finished"));
+                }
+            }
+        }
     }
 
     // One-shot parse of footer.
@@ -1265,8 +1484,17 @@ fn dictionary_page_byte_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "arrow")]
+    use crate::arrow::ArrowWriter;
+    use crate::file::metadata::BloomFilterStatus;
+    #[cfg(feature = "arrow")]
+    use crate::file::properties::WriterProperties;
     use crate::file::reader::Length;
     use crate::util::test_common::file_util::get_test_file;
+    #[cfg(feature = "arrow")]
+    use arrow_array::{Int32Array, RecordBatch};
+    #[cfg(feature = "arrow")]
+    use arrow_schema::{DataType, Field, Schema};
     use std::ops::Range;
 
     #[test]
@@ -1485,6 +1713,102 @@ mod tests {
         assert_eq!(sparse.column_chunk_indices(0, 4).count(), 0);
         assert_eq!(sparse.column_chunk_indices(3, 0).count(), 0);
     }
+
+    #[cfg(feature = "arrow")]
+    fn bloom_test_file(enabled: bool) -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_bloom_filter_enabled(enabled)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(bytes)
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_read_bloom_filters_policy_and_mask() {
+        let file = bloom_test_file(true);
+        let metadata = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_mask(ColumnChunkMask::columns([0]))
+            .parse_and_finish(&file)
+            .unwrap();
+        let filters = metadata.bloom_filters().unwrap();
+        assert!(matches!(
+            filters.status(0, 0).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
+        assert_eq!(filters.status(0, 1).unwrap(), BloomFilterStatus::NotLoaded);
+
+        let absent_file = bloom_test_file(false);
+        let metadata = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .parse_and_finish(&absent_file)
+            .unwrap();
+        let filters = metadata.bloom_filters().unwrap();
+        assert_eq!(filters.status(0, 0).unwrap(), BloomFilterStatus::Absent);
+        assert_eq!(filters.status(0, 1).unwrap(), BloomFilterStatus::Absent);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_read_bloom_filter_and_finish_preserves_attached_provider() {
+        let file = bloom_test_file(true);
+        let loaded = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .parse_and_finish(&file)
+            .unwrap();
+        let original = Arc::clone(loaded.bloom_filters().unwrap());
+        let footer_only = ParquetMetaDataReader::new()
+            .parse_and_finish(&file)
+            .unwrap()
+            .into_builder()
+            .set_bloom_filters(Some(Arc::clone(&original)))
+            .build();
+        let (metadata, filters) = ParquetMetaDataReader::new_with_metadata(footer_only)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_mask(ColumnChunkMask::columns([1]))
+            .read_bloom_filter_and_finish(&file)
+            .unwrap();
+        assert!(filters.is_some());
+        assert!(Arc::ptr_eq(metadata.bloom_filters().unwrap(), &original));
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_read_bloom_filters_error_preserves_metadata() {
+        let file = bloom_test_file(true);
+        let mut metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&file)
+            .unwrap();
+        let row_groups = Arc::make_mut(&mut metadata.row_groups);
+        let column = row_groups[0].columns_mut()[0].clone();
+        row_groups[0].columns_mut()[0] = column
+            .into_builder()
+            .set_bloom_filter_length(Some(1))
+            .build()
+            .unwrap();
+
+        let mut reader = ParquetMetaDataReader::new_with_metadata(metadata)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_mask(ColumnChunkMask::columns([0]));
+        assert!(reader.read_bloom_filters(&file).is_err());
+        assert!(reader.has_metadata());
+    }
 }
 
 #[cfg(all(feature = "async", feature = "arrow", test))]
@@ -1506,11 +1830,96 @@ mod async_tests {
     use tempfile::NamedTempFile;
 
     use crate::arrow::ArrowWriter;
+    use crate::arrow::arrow_reader::ArrowReaderOptions;
+    use crate::arrow::async_reader::AsyncFileReader;
+    use crate::file::metadata::BloomFilterStatus;
     use crate::file::properties::WriterProperties;
     use crate::file::reader::Length;
     use crate::util::test_common::file_util::get_test_file;
 
     struct MetadataFetchFn<F>(F);
+
+    struct CountingAsyncReader {
+        data: Bytes,
+        single_requests: Arc<AtomicUsize>,
+        batch_requests: Arc<AtomicUsize>,
+        batch_ranges: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MalformedBatch {
+        WrongCount,
+        WrongLength,
+    }
+
+    struct MalformedBatchFetch {
+        mode: MalformedBatch,
+    }
+
+    impl MetadataFetch for MalformedBatchFetch {
+        fn fetch(&mut self, _range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+            async move { Err(general_err!("unexpected single-range fetch")) }.boxed()
+        }
+
+        fn fetch_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+            Box::pin(async move {
+                Ok(match self.mode {
+                    MalformedBatch::WrongCount => Vec::new(),
+                    MalformedBatch::WrongLength => ranges.iter().map(|_| Bytes::new()).collect(),
+                })
+            })
+        }
+    }
+
+    impl CountingAsyncReader {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                single_requests: Arc::new(AtomicUsize::new(0)),
+                batch_requests: Arc::new(AtomicUsize::new(0)),
+                batch_ranges: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn slice(data: &Bytes, range: Range<u64>) -> Result<Bytes> {
+            let start = usize::try_from(range.start)?;
+            let end = usize::try_from(range.end)?;
+            data.get(start..end)
+                .map(Bytes::copy_from_slice)
+                .ok_or_else(|| eof_err!("requested range {range:?} exceeds test input"))
+        }
+    }
+
+    impl AsyncFileReader for CountingAsyncReader {
+        fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+            self.single_requests.fetch_add(1, Ordering::SeqCst);
+            let data = self.data.clone();
+            async move { Self::slice(&data, range) }.boxed()
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+            self.batch_requests.fetch_add(1, Ordering::SeqCst);
+            self.batch_ranges.fetch_add(ranges.len(), Ordering::SeqCst);
+            let data = self.data.clone();
+            async move {
+                ranges
+                    .into_iter()
+                    .map(|range| Self::slice(&data, range))
+                    .collect()
+            }
+            .boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+            async move { Err(general_err!("not used by metadata reader tests")) }.boxed()
+        }
+    }
 
     impl<F, Fut> MetadataFetch for MetadataFetchFn<F>
     where
@@ -1561,6 +1970,117 @@ mod async_tests {
         let mut buf = Vec::with_capacity(suffix);
         file.take(suffix as _).read_to_end(&mut buf)?;
         Ok(buf.into())
+    }
+
+    fn bloom_test_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(bytes)
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_batch_fetch_and_sync_equivalence() {
+        let data = bloom_test_bytes();
+        let expected = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .parse_and_finish(&data)
+            .unwrap();
+        let mut input = CountingAsyncReader::new(data.clone());
+        let batch_requests = Arc::clone(&input.batch_requests);
+        let batch_ranges = Arc::clone(&input.batch_ranges);
+        let actual = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .load_and_finish(&mut input, data.len() as u64)
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_ranges.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_unknown_length_batches_two_rounds() {
+        let data = bloom_test_bytes();
+        let mut metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
+        let row_groups = Arc::make_mut(&mut metadata.row_groups);
+        let column = row_groups[0].columns_mut()[0].clone();
+        row_groups[0].columns_mut()[0] = column
+            .into_builder()
+            .set_bloom_filter_length(None)
+            .build()
+            .unwrap();
+
+        let mut input = CountingAsyncReader::new(data);
+        let batch_requests = Arc::clone(&input.batch_requests);
+        let mut loader = ParquetMetaDataReader::new_with_metadata(metadata)
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional)
+            .with_bloom_filter_mask(ColumnChunkMask::columns([0]));
+        loader.load_bloom_filters(&mut input).await.unwrap();
+        let metadata = loader.finish().unwrap();
+
+        assert!(matches!(
+            metadata.bloom_filters().unwrap().status(0, 0).unwrap(),
+            BloomFilterStatus::Present(_)
+        ));
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_skip_uses_no_batch_fetch() {
+        let data = bloom_test_bytes();
+        let mut input = CountingAsyncReader::new(data.clone());
+        let batch_requests = Arc::clone(&input.batch_requests);
+        let metadata = ParquetMetaDataReader::new()
+            .load_and_finish(&mut input, data.len() as u64)
+            .await
+            .unwrap();
+        assert!(metadata.bloom_filters().is_none());
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_rejects_malformed_batch_fetch_results() {
+        let data = bloom_test_bytes();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
+
+        for (mode, expected) in [
+            (MalformedBatch::WrongCount, "must match number of buffers"),
+            (MalformedBatch::WrongLength, "does not match length"),
+        ] {
+            let mut reader = ParquetMetaDataReader::new_with_metadata(metadata.clone())
+                .with_bloom_filter_policy(BloomFilterPolicy::Optional);
+            let err = reader
+                .load_bloom_filters(MalformedBatchFetch { mode })
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err}"
+            );
+            assert!(reader.has_metadata());
+        }
     }
 
     #[tokio::test]

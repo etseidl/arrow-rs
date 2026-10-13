@@ -67,11 +67,39 @@ pub trait MetadataFetch {
     ///
     /// [`FutureExt::boxed`]: futures::FutureExt::boxed
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
+
+    /// Fetches multiple ranges, returning one buffer per range in the same order.
+    ///
+    /// Implementations may override this to issue a batch request. The default fetches ranges
+    /// sequentially for compatibility with existing implementations. The default requires
+    /// `Self: Send` because [`BoxFuture`] is a `Send` future.
+    fn fetch_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>>
+    where
+        Self: Send,
+    {
+        Box::pin(async move {
+            let mut buffers = Vec::new();
+            buffers.try_reserve_exact(ranges.len()).map_err(|err| {
+                crate::errors::ParquetError::General(format!(
+                    "failed to allocate buffers for {} metadata ranges: {err}",
+                    ranges.len()
+                ))
+            })?;
+            for range in ranges {
+                buffers.push(self.fetch(range).await?);
+            }
+            Ok(buffers)
+        })
+    }
 }
 
 impl<T: AsyncFileReader> MetadataFetch for &mut T {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
         self.get_bytes(range)
+    }
+
+    fn fetch_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+        self.get_byte_ranges(ranges)
     }
 }
 

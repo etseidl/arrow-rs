@@ -333,9 +333,6 @@ pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
 ///
 /// This struct is returned by [`decode_bloom_filter_header`] and contains
 /// all the validated offsets and ranges needed to read the filter's bitset.
-/// Temporary expect for Phase 1: These fields will be used in Phase 4 (batch loading)
-/// and Phase 6 (cache integration). Remove this expect in Phase 4.
-#[expect(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct BloomFilterReadInfo {
     /// The file offset where the Bloom filter starts (including header)
@@ -507,6 +504,30 @@ pub(crate) fn decode_bloom_filter_bitset(
     info: &BloomFilterReadInfo,
     bitset: &[u8],
 ) -> Result<Sbbf, ParquetError> {
+    let expected_start = info
+        .filter_offset
+        .checked_add(info.header_len)
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Invalid bloom filter header range at offset {}",
+                info.filter_offset
+            ))
+        })?;
+    let expected_end = info
+        .filter_offset
+        .checked_add(info.total_len)
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Invalid bloom filter total range at offset {}",
+                info.filter_offset
+            ))
+        })?;
+    if info.bitset_range.start != expected_start || info.bitset_range.end != expected_end {
+        return Err(ParquetError::General(format!(
+            "Inconsistent bloom filter read information at offset {}",
+            info.filter_offset
+        )));
+    }
     let expected_len = info
         .bitset_range
         .end
