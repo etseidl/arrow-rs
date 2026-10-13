@@ -42,8 +42,8 @@ use crate::column::page::{PageIterator, PageReader};
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{
-    BloomFilterPolicy, ColumnChunkMask, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
-    ParquetMetaDataReader, ParquetStatisticsPolicy, RowGroupMetaData,
+    BloomFilterPolicy, BloomFilterStatus, ColumnChunkMask, PageIndexPolicy, ParquetMetaData,
+    ParquetMetaDataOptions, ParquetMetaDataReader, ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
@@ -1359,10 +1359,17 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
         row_group_idx: usize,
         column_idx: usize,
     ) -> Result<Option<Sbbf>> {
-        let metadata = self.metadata.row_group(row_group_idx);
-        let column_metadata = metadata.column(column_idx);
+        match self
+            .metadata
+            .bloom_filters_for_row_group(row_group_idx)?
+            .status(column_idx)?
+        {
+            BloomFilterStatus::Present(filter) => return Ok(Some(filter.clone())),
+            BloomFilterStatus::Absent => return Ok(None),
+            BloomFilterStatus::NotLoaded => {}
+        }
 
-        // Delegate to centralized validated reader
+        let column_metadata = self.metadata.row_group(row_group_idx).column(column_idx);
         Sbbf::read_from_column_chunk(column_metadata, &self.input.0)
     }
 

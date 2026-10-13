@@ -42,7 +42,9 @@ use crate::arrow::arrow_reader::{
 
 use crate::bloom_filter::Sbbf;
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::{BloomFilterPolicy, ParquetMetaData, ParquetMetaDataReader};
+use crate::file::metadata::{
+    BloomFilterPolicy, BloomFilterStatus, ParquetMetaData, ParquetMetaDataReader,
+};
 
 mod metadata;
 pub use metadata::*;
@@ -598,8 +600,17 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             decode_bloom_filter_header,
         };
 
-        let metadata = self.metadata.row_group(row_group_idx);
-        let column_metadata = metadata.column(column_idx);
+        match self
+            .metadata
+            .bloom_filters_for_row_group(row_group_idx)?
+            .status(column_idx)?
+        {
+            BloomFilterStatus::Present(filter) => return Ok(Some(filter.clone())),
+            BloomFilterStatus::Absent => return Ok(None),
+            BloomFilterStatus::NotLoaded => {}
+        }
+
+        let column_metadata = self.metadata.row_group(row_group_idx).column(column_idx);
 
         // Extract and validate location from metadata using shared helper
         let Some((offset, total_length)) = bloom_filter_location(column_metadata)? else {

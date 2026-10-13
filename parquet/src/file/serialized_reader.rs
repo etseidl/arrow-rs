@@ -311,11 +311,13 @@ impl<R: 'static + ChunkReader> FileReader for SerializedFileReader<R> {
         let props = Arc::clone(&self.props);
         let f = Arc::clone(&self.chunk_reader);
         let page_index = self.metadata.page_index_for_row_group(i);
-        Ok(Box::new(SerializedRowGroupReader::new(
+        let bloom_filters = self.metadata.bloom_filters_for_row_group(i)?;
+        Ok(Box::new(SerializedRowGroupReader::new_with_bloom_filters(
             f,
             row_group_metadata,
             page_index,
             props,
+            bloom_filters,
         )?))
     }
 
@@ -330,7 +332,12 @@ pub struct SerializedRowGroupReader<'a, R: ChunkReader> {
     metadata: &'a RowGroupMetaData,
     page_index: RowGroupPageIndex,
     props: ReaderPropertiesPtr,
-    bloom_filters: Vec<Option<Sbbf>>,
+    bloom_filters: Option<RowGroupBloomFilterState>,
+}
+
+struct RowGroupBloomFilterState {
+    cached: RowGroupBloomFilters,
+    loaded_fallback: Vec<Option<Sbbf>>,
 }
 
 impl<'a, R: ChunkReader> SerializedRowGroupReader<'a, R> {
@@ -341,14 +348,35 @@ impl<'a, R: ChunkReader> SerializedRowGroupReader<'a, R> {
         page_index: RowGroupPageIndex,
         props: ReaderPropertiesPtr,
     ) -> Result<Self> {
+        let bloom_filters = RowGroupBloomFilters::new(0, metadata.num_columns(), None);
+        Self::new_with_bloom_filters(chunk_reader, metadata, page_index, props, bloom_filters)
+    }
+
+    fn new_with_bloom_filters(
+        chunk_reader: Arc<R>,
+        metadata: &'a RowGroupMetaData,
+        page_index: RowGroupPageIndex,
+        props: ReaderPropertiesPtr,
+        cached: RowGroupBloomFilters,
+    ) -> Result<Self> {
         let bloom_filters = if props.read_bloom_filter() {
-            metadata
+            let loaded_fallback = metadata
                 .columns()
                 .iter()
-                .map(|col| Sbbf::read_from_column_chunk(col, &*chunk_reader))
-                .collect::<Result<Vec<_>>>()?
+                .enumerate()
+                .map(|(column_idx, column)| match cached.status(column_idx)? {
+                    BloomFilterStatus::Present(_) | BloomFilterStatus::Absent => Ok(None),
+                    BloomFilterStatus::NotLoaded => {
+                        Sbbf::read_from_column_chunk(column, &*chunk_reader)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(RowGroupBloomFilterState {
+                cached,
+                loaded_fallback,
+            })
         } else {
-            std::iter::repeat_n(None, metadata.columns().len()).collect()
+            None
         };
         Ok(Self {
             chunk_reader,
@@ -388,7 +416,12 @@ impl<R: 'static + ChunkReader> RowGroupReader for SerializedRowGroupReader<'_, R
 
     /// get bloom filter for the `i`th column
     fn get_column_bloom_filter(&self, i: usize) -> Option<&Sbbf> {
-        self.bloom_filters[i].as_ref()
+        let state = self.bloom_filters.as_ref()?;
+        match state.cached.status(i).ok()? {
+            BloomFilterStatus::Present(filter) => Some(filter),
+            BloomFilterStatus::Absent => None,
+            BloomFilterStatus::NotLoaded => state.loaded_fallback.get(i)?.as_ref(),
+        }
     }
 
     fn get_row_iter(&self, projection: Option<SchemaType>) -> Result<RowIter<'_>> {
@@ -1191,6 +1224,8 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Buf;
 
@@ -1210,6 +1245,130 @@ mod tests {
     use crate::util::test_common::file_util::{get_test_file, get_test_path};
 
     use super::*;
+
+    #[derive(Clone)]
+    struct CountingBytes {
+        data: Bytes,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl CountingBytes {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                requests: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Length for CountingBytes {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    impl ChunkReader for CountingBytes {
+        type T = Cursor<Bytes>;
+
+        fn get_read(&self, start: u64) -> Result<Self::T> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(start)?;
+            let data = self
+                .data
+                .get(start..)
+                .ok_or_else(|| general_err!("invalid test offset {start}"))?;
+            Ok(Cursor::new(Bytes::copy_from_slice(data)))
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(start)?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| general_err!("test range overflow"))?;
+            self.data
+                .get(start..end)
+                .map(Bytes::copy_from_slice)
+                .ok_or_else(|| general_err!("invalid test range {start}..{end}"))
+        }
+    }
+
+    #[test]
+    fn test_serialized_reader_reuses_cached_bloom_filters() {
+        let path = get_test_path("data_index_bloom_encoding_stats.parquet");
+        let data = Bytes::from(std::fs::read(path).unwrap());
+        let metadata = ParquetMetaDataReader::new()
+            .with_bloom_filter_policy(BloomFilterPolicy::Optional(ColumnChunkMask::all()))
+            .parse_and_finish(&data)
+            .unwrap();
+        let input = CountingBytes::new(data.clone());
+        let props = Arc::new(
+            ReaderProperties::builder()
+                .set_read_bloom_filter(true)
+                .build(),
+        );
+
+        let row_group_metadata = metadata.row_group(0);
+        let reader = SerializedRowGroupReader::new_with_bloom_filters(
+            Arc::new(input.clone()),
+            row_group_metadata,
+            metadata.page_index_for_row_group(0),
+            props,
+            metadata.bloom_filters_for_row_group(0).unwrap(),
+        )
+        .unwrap();
+        let state = reader.bloom_filters.as_ref().unwrap();
+        assert!(state.loaded_fallback.iter().all(Option::is_none));
+        assert_eq!(input.request_count(), 0);
+
+        let cached_column = (0..row_group_metadata.num_columns())
+            .find(|&column_idx| {
+                matches!(
+                    state.cached.status(column_idx).unwrap(),
+                    BloomFilterStatus::Present(_)
+                )
+            })
+            .unwrap();
+        let BloomFilterStatus::Present(cached) = state.cached.status(cached_column).unwrap() else {
+            unreachable!()
+        };
+        assert!(std::ptr::eq(
+            reader.get_column_bloom_filter(cached_column).unwrap(),
+            cached
+        ));
+
+        let footer_only = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
+        let input = CountingBytes::new(data.clone());
+        let file_reader = SerializedFileReader {
+            chunk_reader: Arc::new(input.clone()),
+            metadata: Arc::new(footer_only),
+            props: Arc::new(
+                ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build(),
+            ),
+        };
+        assert_eq!(input.request_count(), 0);
+        file_reader.get_row_group(0).unwrap();
+        assert!(input.request_count() > 0);
+
+        let input = CountingBytes::new(data);
+        let row_group = SerializedRowGroupReader::new(
+            Arc::new(input.clone()),
+            metadata.row_group(0),
+            metadata.page_index_for_row_group(0),
+            Arc::new(ReaderProperties::builder().build()),
+        )
+        .unwrap();
+        assert_eq!(input.request_count(), 0);
+        assert!(row_group.get_column_bloom_filter(cached_column).is_none());
+    }
 
     #[test]
     fn test_decode_page_invalid_offset() {

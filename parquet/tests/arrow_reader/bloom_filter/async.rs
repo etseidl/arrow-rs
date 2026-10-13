@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::malformed_bloom_filter_header;
+use super::{cache_options, cached_bloom_filter_file, malformed_bloom_filter_header};
 use crate::io::TestReader;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use parquet::{
     arrow::{
-        ArrowWriter, ParquetRecordBatchStreamBuilder, arrow_reader::ParquetRecordBatchReaderBuilder,
+        ArrowWriter, ParquetRecordBatchStreamBuilder,
+        arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder},
     },
+    file::metadata::ColumnChunkMask,
     file::properties::WriterProperties,
 };
 
@@ -108,4 +110,55 @@ async fn test_get_row_group_column_bloom_filter(data: Bytes, with_length: bool) 
         .unwrap();
     assert!(sbbf.check(&"Hello"));
     assert!(!sbbf.check(&"Hello_Not_Exists"));
+}
+
+#[tokio::test]
+async fn test_cached_bloom_filter_status_controls_async_io() {
+    let data = cached_bloom_filter_file();
+    let metadata = ArrowReaderMetadata::load(&data, cache_options(ColumnChunkMask::all())).unwrap();
+    let input = TestReader::new(data.clone());
+    let requests = input.requests();
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(input, metadata);
+
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 0)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(1, 0)
+            .await
+            .is_err()
+    );
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 2)
+            .await
+            .is_err()
+    );
+    assert!(requests.lock().unwrap().is_empty());
+
+    let metadata =
+        ArrowReaderMetadata::load(&data, cache_options(ColumnChunkMask::columns([1]))).unwrap();
+    let input = TestReader::new(data);
+    let requests = input.requests();
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(input, metadata);
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 0)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!requests.lock().unwrap().is_empty());
 }

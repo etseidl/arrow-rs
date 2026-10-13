@@ -19,9 +19,15 @@ use std::fs::File;
 
 use bytes::Bytes;
 use parquet::{
-    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    arrow::{
+        ArrowWriter,
+        arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder},
+    },
     file::properties::WriterProperties,
 };
+
+use super::{CountingChunkReader, cache_options, cached_bloom_filter_file};
+use parquet::file::metadata::ColumnChunkMask;
 
 #[test]
 #[cfg_attr(miri, ignore)] // Takes too long
@@ -72,4 +78,40 @@ fn test_get_row_group_column_bloom_filter(data: Bytes, with_length: bool) {
         .unwrap();
     assert!(sbbf.check(&"Hello"));
     assert!(!sbbf.check(&"Hello_Not_Exists"));
+}
+
+#[test]
+fn test_cached_bloom_filter_status_controls_sync_io() {
+    let data = cached_bloom_filter_file();
+    let metadata = ArrowReaderMetadata::load(&data, cache_options(ColumnChunkMask::all())).unwrap();
+    let input = CountingChunkReader::new(data.clone());
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input.clone(), metadata);
+
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(builder.get_row_group_column_bloom_filter(1, 0).is_err());
+    assert!(builder.get_row_group_column_bloom_filter(0, 2).is_err());
+    assert_eq!(input.request_count(), 0);
+
+    let metadata =
+        ArrowReaderMetadata::load(&data, cache_options(ColumnChunkMask::columns([1]))).unwrap();
+    let input = CountingChunkReader::new(data);
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input.clone(), metadata);
+    assert!(
+        builder
+            .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(input.request_count() > 0);
 }

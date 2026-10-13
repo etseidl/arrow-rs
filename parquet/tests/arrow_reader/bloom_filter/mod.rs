@@ -19,10 +19,101 @@
 mod r#async;
 mod sync;
 
-#[cfg(feature = "async")]
 use bytes::Bytes;
+use std::io::Cursor;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use arrow_array::{Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 #[cfg(feature = "async")]
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::arrow::{ArrowWriter, arrow_reader::ArrowReaderOptions};
+use parquet::errors::{ParquetError, Result};
+use parquet::file::metadata::{BloomFilterPolicy, ColumnChunkMask};
+use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{ChunkReader, Length};
+use parquet::schema::types::ColumnPath;
+
+fn cached_bloom_filter_file() -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_column_bloom_filter_enabled(ColumnPath::from("a"), true)
+        .build();
+    let mut data = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut data, schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    data.into()
+}
+
+fn cache_options(mask: ColumnChunkMask) -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_bloom_filter_policy(BloomFilterPolicy::Optional(mask))
+}
+
+#[derive(Clone)]
+struct CountingChunkReader {
+    data: Bytes,
+    requests: Arc<AtomicUsize>,
+}
+
+impl CountingChunkReader {
+    fn new(data: Bytes) -> Self {
+        Self {
+            data,
+            requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Length for CountingChunkReader {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
+impl ChunkReader for CountingChunkReader {
+    type T = Cursor<Bytes>;
+
+    fn get_read(&self, start: u64) -> Result<Self::T> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let start = usize::try_from(start)?;
+        let data = self
+            .data
+            .get(start..)
+            .ok_or_else(|| ParquetError::General(format!("invalid test offset {start}")))?;
+        Ok(Cursor::new(Bytes::copy_from_slice(data)))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let start = usize::try_from(start)?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| ParquetError::General("test range overflow".into()))?;
+        self.data
+            .get(start..end)
+            .map(Bytes::copy_from_slice)
+            .ok_or_else(|| ParquetError::General(format!("invalid test range {start}..{end}")))
+    }
+}
 
 #[cfg(feature = "async")]
 fn malformed_bloom_filter_header() -> (Bytes, ArrowReaderMetadata) {
