@@ -19,9 +19,12 @@
 mod r#async;
 mod sync;
 
+#[cfg(feature = "async")]
 use bytes::Bytes;
+#[cfg(feature = "async")]
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
+#[cfg(feature = "async")]
 fn malformed_bloom_filter_header() -> (Bytes, ArrowReaderMetadata) {
     let testdata = arrow::util::test_util::parquet_test_data();
     let path = format!("{testdata}/data_index_bloom_encoding_stats.parquet");
