@@ -104,6 +104,3 @@ __pycache__/
 
 # Parquet file from arrow_reader_clickbench
 hits_1.parquet
-
-# LLM directories
-.claude
