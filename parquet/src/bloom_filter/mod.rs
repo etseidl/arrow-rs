@@ -324,16 +324,21 @@ pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
 
 /// given an initial offset, and a byte buffer, try to read out a bloom filter header and return
 /// both the header and the offset after it (for bitset).
+#[cfg(any(feature = "arrow", test))]
 pub(crate) fn chunk_read_bloom_filter_header_and_offset(
     offset: u64,
     buffer: Bytes,
 ) -> Result<(BloomFilterHeader, u64), ParquetError> {
     let (header, length) = read_bloom_filter_header_and_length(buffer)?;
-    Ok((header, offset + length))
+    let bitset_offset = offset
+        .checked_add(length)
+        .ok_or_else(|| general_err!("Bloom filter offset overflow"))?;
+    Ok((header, bitset_offset))
 }
 
 /// given a [Bytes] buffer, try to read out a bloom filter header and return both the header and
 /// length of the header.
+#[cfg(any(feature = "arrow", test))]
 #[inline]
 pub(crate) fn read_bloom_filter_header_and_length(
     buffer: Bytes,
@@ -352,6 +357,94 @@ fn read_bloom_filter_header_and_length_from_bytes(
     let header = BloomFilterHeader::read_thrift(&mut prot)
         .map_err(|e| ParquetError::General(format!("Could not read bloom filter header: {e}")))?;
     Ok((header, (total_length - prot.as_slice().len()) as u64))
+}
+
+/// Information derived from a decoded header, without allocating its bitset.
+struct BloomFilterReadInfo {
+    header_len: usize,
+    bitset_len: usize,
+    bitset_offset: u64,
+}
+
+fn decode_bloom_filter_header(
+    offset: u64,
+    bytes: &[u8],
+    advertised_len: Option<usize>,
+) -> Result<BloomFilterReadInfo> {
+    // The typed header decoder also rejects unsupported algorithm/hash/compression unions.
+    let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(bytes)?;
+    let bitset_len = usize::try_from(header.num_bytes)
+        .map_err(|_| general_err!("Bloom filter length is invalid: {}", header.num_bytes))?;
+    if bitset_len < size_of::<Block>() || !bitset_len.is_multiple_of(size_of::<Block>()) {
+        return Err(general_err!(
+            "Bloom filter bitset length {bitset_len} must be a positive multiple of {}",
+            size_of::<Block>()
+        ));
+    }
+    let bitset_offset = offset
+        .checked_add(header_len)
+        .ok_or_else(|| general_err!("Bloom filter offset overflow"))?;
+    bitset_offset
+        .checked_add(bitset_len as u64)
+        .ok_or_else(|| general_err!("Bloom filter end offset overflow"))?;
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| general_err!("Bloom filter header length is invalid"))?;
+    let total_len = header_len
+        .checked_add(bitset_len)
+        .ok_or_else(|| general_err!("Bloom filter total length overflow"))?;
+    if let Some(advertised_len) = advertised_len
+        && advertised_len != total_len
+    {
+        return Err(general_err!(
+            "Bloom filter length mismatch: expected {total_len} bytes, got {advertised_len}"
+        ));
+    }
+    Ok(BloomFilterReadInfo {
+        header_len,
+        bitset_len,
+        bitset_offset,
+    })
+}
+
+fn decode_bloom_filter_bitset(info: &BloomFilterReadInfo, bytes: &[u8]) -> Result<Sbbf> {
+    if bytes.len() != info.bitset_len {
+        return Err(general_err!(
+            "Bloom filter bitset length mismatch: expected {} bytes, got {}",
+            info.bitset_len,
+            bytes.len()
+        ));
+    }
+    let (chunks, remainder) = bytes.as_chunks::<32>();
+    debug_assert!(remainder.is_empty());
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(chunks.len())
+        .map_err(|err| general_err!("Could not allocate Bloom filter blocks: {err}"))?;
+    for chunk in chunks {
+        let mut block = Block::ZERO;
+        for (word, bytes) in block.0.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
+        }
+        blocks.push(block);
+    }
+    Ok(Sbbf(blocks))
+}
+
+fn read_bloom_filter_bytes<R: ChunkReader>(reader: &R, offset: u64, len: usize) -> Result<Bytes> {
+    let end = offset
+        .checked_add(len as u64)
+        .ok_or_else(|| general_err!("Bloom filter read range overflow"))?;
+    if end > reader.len() {
+        return Err(eof_err!("Bloom filter read range exceeds file length"));
+    }
+    let bytes = reader.get_bytes(offset, len)?;
+    if bytes.len() != len {
+        return Err(general_err!(
+            "Bloom filter read length mismatch: expected {len} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The minimum number of bytes for a bloom filter bitset.
@@ -471,53 +564,36 @@ impl Sbbf {
     }
 
     /// Read a new bloom filter from the given offset in the given reader.
+    /// Returns `None` when no offset is present, and an error for invalid or truncated data.
     pub fn read_from_column_chunk<R: ChunkReader>(
         column_metadata: &ColumnChunkMetaData,
         reader: &R,
     ) -> Result<Option<Self>, ParquetError> {
-        let offset: u64 = if let Some(offset) = column_metadata.bloom_filter_offset() {
-            offset
-                .try_into()
-                .map_err(|_| ParquetError::General("Bloom filter offset is invalid".to_string()))?
-        } else {
+        let Some(offset) = column_metadata.bloom_filter_offset() else {
             return Ok(None);
         };
-
-        let buffer = match column_metadata.bloom_filter_length() {
-            Some(length) => reader.get_bytes(offset, length as usize),
-            None => reader.get_bytes(offset, SBBF_HEADER_SIZE_ESTIMATE),
-        }?;
-
-        let (header, bitset_offset) =
-            chunk_read_bloom_filter_header_and_offset(offset, buffer.clone())?;
-
-        match header.algorithm {
-            BloomFilterAlgorithm::BLOCK => {
-                // this match exists to future proof the singleton algorithm enum
-            }
+        let offset =
+            u64::try_from(offset).map_err(|_| general_err!("Bloom filter offset is invalid"))?;
+        let total_len = column_metadata
+            .bloom_filter_length()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| general_err!("Bloom filter length is invalid"))?;
+        let buffer = read_bloom_filter_bytes(
+            reader,
+            offset,
+            total_len.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE),
+        )?;
+        let info = decode_bloom_filter_header(offset, &buffer, total_len)?;
+        if total_len.is_some() {
+            let bitset = buffer
+                .get(info.header_len..)
+                .ok_or_else(|| general_err!("Bloom filter bitset is truncated"))?;
+            decode_bloom_filter_bitset(&info, bitset).map(Some)
+        } else {
+            let bitset = read_bloom_filter_bytes(reader, info.bitset_offset, info.bitset_len)?;
+            decode_bloom_filter_bitset(&info, &bitset).map(Some)
         }
-        match header.compression {
-            BloomFilterCompression::UNCOMPRESSED => {
-                // this match exists to future proof the singleton compression enum
-            }
-        }
-        match header.hash {
-            BloomFilterHash::XXHASH => {
-                // this match exists to future proof the singleton hash enum
-            }
-        }
-
-        let bitset = match column_metadata.bloom_filter_length() {
-            Some(_) => buffer.slice((bitset_offset - offset) as usize..),
-            None => {
-                let bitset_length: usize = header.num_bytes.try_into().map_err(|_| {
-                    ParquetError::General("Bloom filter length is invalid".to_string())
-                })?;
-                reader.get_bytes(bitset_offset, bitset_length)?
-            }
-        };
-
-        Ok(Some(Self::new(&bitset)))
     }
 
     /// Map a 64-bit hash to a block index in `[0, num_blocks)`.
@@ -729,7 +805,9 @@ impl Sbbf {
         self.0.shrink_to_fit();
     }
 
-    /// Reads a Sbff from Thrift encoded bytes
+    /// Reads an SBBF from a Thrift header followed by its complete bitset.
+    /// Accepts any positive number of 32-byte blocks, not only power-of-two sizes.
+    /// Returns an error for invalid headers, incomplete blocks, or extra bytes.
     ///
     /// # Examples
     ///
@@ -752,29 +830,11 @@ impl Sbbf {
     /// # }
     /// ```
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParquetError> {
-        let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(bytes)?;
-
-        let bitset_length: u64 = header
-            .num_bytes
-            .try_into()
-            .map_err(|_| ParquetError::General("Bloom filter length is invalid".to_string()))?;
-
-        // Validate that bitset consumes all remaining bytes
-        if header_len + bitset_length != bytes.len() as u64 {
-            return Err(ParquetError::General(format!(
-                "Bloom filter data contains extra bytes: expected {} total bytes, got {}",
-                header_len + bitset_length,
-                bytes.len()
-            )));
-        }
-
-        let start = header_len as usize;
-        let end = (header_len + bitset_length) as usize;
+        let info = decode_bloom_filter_header(0, bytes, Some(bytes.len()))?;
         let bitset = bytes
-            .get(start..end)
-            .ok_or_else(|| ParquetError::General("Bloom filter bitset is invalid".to_string()))?;
-
-        Ok(Self::new(bitset))
+            .get(info.header_len..)
+            .ok_or_else(|| general_err!("Bloom filter bitset is truncated"))?;
+        decode_bloom_filter_bitset(&info, bitset)
     }
 }
 
@@ -789,6 +849,235 @@ fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::reader::Length;
+    use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+    use std::collections::VecDeque;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    fn encode_bloom_filter(num_bytes: i32, bitset_len: usize) -> Vec<u8> {
+        let header = BloomFilterHeader {
+            num_bytes,
+            algorithm: BloomFilterAlgorithm::BLOCK,
+            hash: BloomFilterHash::XXHASH,
+            compression: BloomFilterCompression::UNCOMPRESSED,
+        };
+        let mut bytes = Vec::new();
+        header
+            .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut bytes))
+            .unwrap();
+        bytes.resize(bytes.len() + bitset_len, 0);
+        bytes
+    }
+
+    fn bloom_filter_column(offset: Option<i64>, length: Option<i32>) -> ColumnChunkMetaData {
+        let descriptor = Arc::new(ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("test", crate::basic::Type::INT32)
+                    .build()
+                    .unwrap(),
+            ),
+            0,
+            0,
+            ColumnPath::new(vec!["test".to_string()]),
+        ));
+        ColumnChunkMetaData::builder(descriptor)
+            .set_bloom_filter_offset(offset)
+            .set_bloom_filter_length(length)
+            .build()
+            .unwrap()
+    }
+
+    struct ScriptedReader {
+        len: u64,
+        responses: Mutex<VecDeque<Bytes>>,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl ScriptedReader {
+        fn new(len: u64, responses: Vec<Bytes>) -> Self {
+            Self {
+                len,
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Length for ScriptedReader {
+        fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    impl ChunkReader for ScriptedReader {
+        type T = Cursor<Bytes>;
+
+        fn get_read(&self, _start: u64) -> Result<Self::T> {
+            panic!("Bloom decoding must use ranged reads")
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+            self.requests.lock().unwrap().push((start, length));
+            Ok(self.responses.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    #[test]
+    fn test_decode_complete_blocks_and_membership() {
+        for size in [32, 96] {
+            let mut original = Sbbf::new(&vec![0; size]);
+            let values = ["hello", "world", "parquet"];
+            for value in values {
+                original.insert(&value);
+            }
+            let mut serialized = Vec::new();
+            original.write(&mut serialized).unwrap();
+            let from_bytes = Sbbf::from_bytes(&serialized).unwrap();
+            let mut file = vec![0; 7];
+            file.extend_from_slice(&serialized);
+            file.push(0xaa); // unrelated bytes after the filter
+            let reader = Bytes::from(file);
+            for length in [Some(serialized.len() as i32), None] {
+                let column = bloom_filter_column(Some(7), length);
+                let decoded = Sbbf::read_from_column_chunk(&column, &reader)
+                    .unwrap()
+                    .unwrap();
+                for value in values {
+                    assert!(decoded.check(&value));
+                    assert!(from_bytes.check(&value));
+                }
+                let mut bitset = Vec::new();
+                decoded.write_bitset(&mut bitset).unwrap();
+                assert_eq!(bitset.len(), size);
+                let mut round_trip = Vec::new();
+                decoded.write(&mut round_trip).unwrap();
+                assert_eq!(round_trip, serialized);
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_sizes_and_mismatched_bitsets() {
+        for (num_bytes, payload_len) in [
+            (-1, 32),
+            (0, 0),
+            (16, 16),
+            (31, 31),
+            (33, 33),
+            (32, 31),
+            (32, 33),
+            (32, 64),
+        ] {
+            let bytes = encode_bloom_filter(num_bytes, payload_len);
+            assert!(Sbbf::from_bytes(&bytes).is_err());
+            let column = bloom_filter_column(Some(0), Some(bytes.len() as i32));
+            assert!(Sbbf::read_from_column_chunk(&column, &Bytes::from(bytes)).is_err());
+        }
+        // Invalid header sizes also fail before requesting the legacy bitset.
+        for num_bytes in [-1, 0, 16, 33] {
+            let mut header = encode_bloom_filter(num_bytes, 0);
+            header.resize(SBBF_HEADER_SIZE_ESTIMATE, 0);
+            let reader = ScriptedReader::new(100, vec![Bytes::from(header)]);
+            assert!(
+                Sbbf::read_from_column_chunk(&bloom_filter_column(Some(0), None), &reader).is_err()
+            );
+            assert_eq!(reader.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_headers() {
+        let canonical = encode_bloom_filter(32, 32);
+        let mut malformed = vec![vec![], canonical[..14].to_vec()];
+        for index in [3, 7, 11] {
+            let mut bytes = canonical.clone();
+            bytes[index] = 0x2c; // unsupported union member 2
+            malformed.push(bytes);
+        }
+        for bytes in malformed {
+            assert!(Sbbf::from_bytes(&bytes).is_err());
+            let column = bloom_filter_column(Some(0), Some(bytes.len() as i32));
+            assert!(Sbbf::read_from_column_chunk(&column, &Bytes::from(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_decode_validates_metadata_and_read_ranges() {
+        let no_reads = ScriptedReader::new(100, vec![]);
+        assert!(
+            Sbbf::read_from_column_chunk(&bloom_filter_column(None, Some(-1)), &no_reads)
+                .unwrap()
+                .is_none()
+        );
+        for (offset, length) in [(Some(-1), None), (Some(0), Some(-1)), (Some(100), Some(47))] {
+            assert!(
+                Sbbf::read_from_column_chunk(&bloom_filter_column(offset, length), &no_reads)
+                    .is_err()
+            );
+        }
+        assert!(no_reads.requests.lock().unwrap().is_empty());
+
+        let header = encode_bloom_filter(32, 0);
+        assert!(
+            chunk_read_bloom_filter_header_and_offset(u64::MAX, Bytes::from(header.clone()))
+                .is_err()
+        );
+        assert!(decode_bloom_filter_header(u64::MAX - header.len() as u64, &header, None).is_err());
+        // Reader format validity is not restricted by the writer's allocation cap.
+        let size = BITSET_MAX_LENGTH + 32;
+        let info =
+            decode_bloom_filter_header(0, &encode_bloom_filter(size as i32, 0), None).unwrap();
+        assert_eq!(info.bitset_len, size);
+    }
+
+    #[test]
+    fn test_decode_requires_exact_reader_responses() {
+        let bytes = Bytes::from(encode_bloom_filter(32, 32));
+        let total_len = bytes.len();
+        for length in [total_len - 1, total_len + 1] {
+            let column = bloom_filter_column(Some(7), Some(length as i32));
+            let reader = ScriptedReader::new(100, vec![bytes.clone()]);
+            assert!(Sbbf::read_from_column_chunk(&column, &reader).is_err());
+        }
+        for response_len in [total_len - 1, total_len + 1] {
+            let mut response = bytes.to_vec();
+            response.resize(response_len, 0);
+            let column = bloom_filter_column(Some(7), Some(total_len as i32));
+            let reader = ScriptedReader::new(100, vec![Bytes::from(response)]);
+            assert!(Sbbf::read_from_column_chunk(&column, &reader).is_err());
+        }
+        for response_len in [19, 21] {
+            let reader = ScriptedReader::new(100, vec![bytes.slice(..response_len)]);
+            assert!(
+                Sbbf::read_from_column_chunk(&bloom_filter_column(Some(7), None), &reader).is_err()
+            );
+        }
+        for response_len in [31, 33] {
+            let reader = ScriptedReader::new(
+                100,
+                vec![bytes.slice(..20), Bytes::from(vec![0; response_len])],
+            );
+            assert!(
+                Sbbf::read_from_column_chunk(&bloom_filter_column(Some(7), None), &reader).is_err()
+            );
+            assert_eq!(*reader.requests.lock().unwrap(), [(7, 20), (22, 32)]);
+        }
+    }
+
+    #[test]
+    fn test_decode_accepts_unknown_fields_at_legacy_header_boundary() {
+        let mut bytes = vec![
+            0x15, 64, 0x1c, 0x1c, 0, 0, 0x1c, 0x1c, 0, 0, 0x29, 0x22, 1, 2, 0x0c, 8, 0x1c, 0, 0, 0,
+        ];
+        bytes.extend_from_slice(&[0; 32]);
+        assert_eq!(Sbbf::from_bytes(&bytes).unwrap().num_blocks(), 1);
+        let reader = Bytes::from(bytes);
+        let filter = Sbbf::read_from_column_chunk(&bloom_filter_column(Some(0), None), &reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.num_blocks(), 1);
+    }
 
     #[test]
     fn test_hash_bytes() {
