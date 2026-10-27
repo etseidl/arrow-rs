@@ -371,8 +371,17 @@ fn decode_bloom_filter_header(
     bytes: &[u8],
     advertised_len: Option<usize>,
 ) -> Result<BloomFilterReadInfo> {
-    // The typed header decoder also rejects unsupported algorithm/hash/compression unions.
     let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(bytes)?;
+    // Require an explicit decoding decision when new variants are added.
+    match header.algorithm {
+        BloomFilterAlgorithm::BLOCK => {}
+    }
+    match header.hash {
+        BloomFilterHash::XXHASH => {}
+    }
+    match header.compression {
+        BloomFilterCompression::UNCOMPRESSED => {}
+    }
     let bitset_len = usize::try_from(header.num_bytes)
         .map_err(|_| general_err!("Bloom filter length is invalid: {}", header.num_bytes))?;
     if bitset_len < size_of::<Block>() || !bitset_len.is_multiple_of(size_of::<Block>()) {
