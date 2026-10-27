@@ -72,6 +72,18 @@ pub trait MetadataFetch {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
 }
 
+impl MetadataFetch for Box<dyn MetadataFetch + '_> {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        self.as_mut().fetch(range)
+    }
+}
+
+impl MetadataFetch for &mut dyn MetadataFetch {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        (**self).fetch(range)
+    }
+}
+
 /// A data source that can be used with [`ParquetMetaDataReader`] to load [`ParquetMetaData`] via suffix
 /// requests, without knowing the file size
 ///

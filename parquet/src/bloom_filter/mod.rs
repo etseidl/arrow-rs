@@ -629,6 +629,48 @@ impl Sbbf {
         }
     }
 
+    /// Load a filter asynchronously using only existing column metadata and a range source.
+    ///
+    /// Requires the `async` feature, but not `arrow`. No footer, page, or schema
+    /// reads are performed, and a missing offset returns `None` without I/O.
+    /// Metadata and the source must refer to the same file. Errors and missing
+    /// filters are not membership evidence. No result is cached automatically.
+    #[cfg(feature = "async")]
+    pub async fn read_from_column_chunk_async<F: crate::file::metadata::MetadataFetch>(
+        column_metadata: &ColumnChunkMetaData,
+        fetch: F,
+    ) -> Result<Option<Self>> {
+        Self::read_from_column_chunk_async_with_options(
+            column_metadata,
+            fetch,
+            &BloomFilterReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Asynchronously load a filter with explicit resource limits and optional
+    /// known file length. Without a known length, the source must detect EOF.
+    ///
+    /// This uses the same bounded planner and decoder as the synchronous reader.
+    #[cfg(feature = "async")]
+    pub async fn read_from_column_chunk_async_with_options<
+        F: crate::file::metadata::MetadataFetch,
+    >(
+        column_metadata: &ColumnChunkMetaData,
+        mut fetch: F,
+        options: &BloomFilterReadOptions,
+    ) -> Result<Option<Self>> {
+        let Some(mut plan) = BloomFilterReadPlan::new(column_metadata, options)? else {
+            return Ok(None);
+        };
+        loop {
+            let bytes = fetch.fetch(plan.range()).await?;
+            if let Some(filter) = plan.advance(bytes)? {
+                return Ok(Some(filter));
+            }
+        }
+    }
+
     /// Map a 64-bit hash to a block index in `[0, num_blocks)`.
     ///
     /// Uses the "multiply-and-shift" trick (a fast alternative to modulo):
@@ -1221,6 +1263,108 @@ mod tests {
             *reader.requests.lock().unwrap(),
             [(0, 20), (header_len, 128 * 1024)]
         );
+    }
+
+    #[cfg(feature = "async")]
+    struct RecordingFetch<'a> {
+        bytes: Bytes,
+        requests: &'a mut Vec<std::ops::Range<u64>>,
+    }
+
+    #[cfg(feature = "async")]
+    impl crate::file::metadata::MetadataFetch for RecordingFetch<'_> {
+        fn fetch(
+            &mut self,
+            range: std::ops::Range<u64>,
+        ) -> futures::future::BoxFuture<'_, Result<Bytes>> {
+            self.requests.push(range.clone());
+            Box::pin(futures::future::ready(Ok(self
+                .bytes
+                .slice(range.start as usize..range.end as usize))))
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_single_filter_from_preloaded_column() {
+        let mut original = Sbbf::new_with_num_of_bytes(32);
+        original.insert("async sketch");
+        let mut serialized = Vec::new();
+        original.write(&mut serialized).unwrap();
+        let bytes = Bytes::from(serialized);
+        let mut requests = Vec::new();
+        let column = bloom_filter_column(Some(0), Some(bytes.len() as i32));
+        let mut source = RecordingFetch {
+            bytes: bytes.clone(),
+            requests: &mut requests,
+        };
+        // Exercise a borrowed trait object without Send or 'static requirements.
+        let borrowed: &mut dyn crate::file::metadata::MetadataFetch = &mut source;
+        let filter = Sbbf::read_from_column_chunk_async(&column, borrowed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(filter.check("async sketch"));
+        assert!(Sbbf::from_bytes(&bytes).unwrap().check("async sketch"));
+        assert_eq!(requests, [0..bytes.len() as u64]);
+        requests.clear();
+
+        let source: Box<dyn crate::file::metadata::MetadataFetch + '_> = Box::new(RecordingFetch {
+            bytes: bytes.clone(),
+            requests: &mut requests,
+        });
+        let legacy = bloom_filter_column(Some(0), None);
+        let filter = Sbbf::read_from_column_chunk_async(&legacy, source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(filter.check("async sketch"));
+        assert_eq!(requests, [0..20, 15..47]);
+        requests.clear();
+
+        let source = RecordingFetch {
+            bytes,
+            requests: &mut requests,
+        };
+        assert!(
+            Sbbf::read_from_column_chunk_async(&bloom_filter_column(None, None), source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(requests.is_empty());
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_single_filter_rejects_bad_response_and_eof() {
+        struct WrongLength;
+        impl crate::file::metadata::MetadataFetch for WrongLength {
+            fn fetch(
+                &mut self,
+                _: std::ops::Range<u64>,
+            ) -> futures::future::BoxFuture<'_, Result<Bytes>> {
+                Box::pin(futures::future::ready(Ok(Bytes::new())))
+            }
+        }
+        let column = bloom_filter_column(Some(0), Some(47));
+        assert!(
+            Sbbf::read_from_column_chunk_async(&column, WrongLength)
+                .await
+                .is_err()
+        );
+        let mut requests = Vec::new();
+        let source = RecordingFetch {
+            bytes: Bytes::new(),
+            requests: &mut requests,
+        };
+        let options = BloomFilterReadOptions::default().with_file_length(46);
+        assert!(
+            Sbbf::read_from_column_chunk_async_with_options(&column, source, &options)
+                .await
+                .is_err()
+        );
+        assert!(requests.is_empty());
     }
 
     #[test]
