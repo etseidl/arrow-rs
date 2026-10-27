@@ -322,6 +322,10 @@ pub struct Sbbf(Vec<Block>);
 
 pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
 
+mod reader;
+pub use reader::BloomFilterReadOptions;
+use reader::BloomFilterReadPlan;
+
 /// given an initial offset, and a byte buffer, try to read out a bloom filter header and return
 /// both the header and the offset after it (for bitset).
 #[cfg(any(feature = "arrow", test))]
@@ -372,6 +376,15 @@ fn decode_bloom_filter_header(
     advertised_len: Option<usize>,
 ) -> Result<BloomFilterReadInfo> {
     let (header, header_len) = read_bloom_filter_header_and_length_from_bytes(bytes)?;
+    bloom_filter_read_info(offset, header, header_len, advertised_len)
+}
+
+fn bloom_filter_read_info(
+    offset: u64,
+    header: BloomFilterHeader,
+    header_len: u64,
+    advertised_len: Option<usize>,
+) -> Result<BloomFilterReadInfo> {
     // Require an explicit decoding decision when new variants are added.
     match header.algorithm {
         BloomFilterAlgorithm::BLOCK => {}
@@ -578,30 +591,41 @@ impl Sbbf {
         column_metadata: &ColumnChunkMetaData,
         reader: &R,
     ) -> Result<Option<Self>, ParquetError> {
-        let Some(offset) = column_metadata.bloom_filter_offset() else {
+        Self::read_from_column_chunk_with_options(
+            column_metadata,
+            reader,
+            &BloomFilterReadOptions::default(),
+        )
+    }
+
+    /// Read a filter with explicit per-filter resource limits.
+    ///
+    /// The actual reader length always bounds requests. If an options file length
+    /// is supplied, it must match the reader. Metadata must belong to this file.
+    pub fn read_from_column_chunk_with_options<R: ChunkReader>(
+        column_metadata: &ColumnChunkMetaData,
+        reader: &R,
+        options: &BloomFilterReadOptions,
+    ) -> Result<Option<Self>> {
+        if column_metadata.bloom_filter_offset().is_none() {
+            return Ok(None);
+        }
+        if options.file_length().is_some_and(|len| len != reader.len()) {
+            return Err(general_err!(
+                "Bloom filter file length disagrees with reader"
+            ));
+        }
+        let options = options.clone().with_file_length(reader.len());
+        let Some(mut plan) = BloomFilterReadPlan::new(column_metadata, &options)? else {
             return Ok(None);
         };
-        let offset =
-            u64::try_from(offset).map_err(|_| general_err!("Bloom filter offset is invalid"))?;
-        let total_len = column_metadata
-            .bloom_filter_length()
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| general_err!("Bloom filter length is invalid"))?;
-        let buffer = read_bloom_filter_bytes(
-            reader,
-            offset,
-            total_len.unwrap_or(SBBF_HEADER_SIZE_ESTIMATE),
-        )?;
-        let info = decode_bloom_filter_header(offset, &buffer, total_len)?;
-        if total_len.is_some() {
-            let bitset = buffer
-                .get(info.header_len..)
-                .ok_or_else(|| general_err!("Bloom filter bitset is truncated"))?;
-            decode_bloom_filter_bitset(&info, bitset).map(Some)
-        } else {
-            let bitset = read_bloom_filter_bytes(reader, info.bitset_offset, info.bitset_len)?;
-            decode_bloom_filter_bitset(&info, &bitset).map(Some)
+        loop {
+            let range = plan.range();
+            let bytes =
+                read_bloom_filter_bytes(reader, range.start, (range.end - range.start) as usize)?;
+            if let Some(filter) = plan.advance(bytes)? {
+                return Ok(Some(filter));
+            }
         }
     }
 
@@ -1086,6 +1110,117 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(filter.num_blocks(), 1);
+    }
+
+    #[test]
+    fn test_read_options_bound_requests() {
+        let no_reads = ScriptedReader::new(100, vec![]);
+        for length in [0, i32::MAX] {
+            assert!(
+                Sbbf::read_from_column_chunk(
+                    &bloom_filter_column(Some(0), Some(length)),
+                    &no_reads
+                )
+                .is_err()
+            );
+        }
+        let options = BloomFilterReadOptions::default().with_file_length(99);
+        assert!(
+            Sbbf::read_from_column_chunk_with_options(
+                &bloom_filter_column(Some(0), None),
+                &no_reads,
+                &options
+            )
+            .is_err()
+        );
+        assert!(no_reads.requests.lock().unwrap().is_empty());
+
+        let options = BloomFilterReadOptions::default().with_max_bitset_bytes(32);
+        let reader = ScriptedReader::new(1000, vec![Bytes::from(encode_bloom_filter(96, 96))]);
+        assert!(
+            Sbbf::read_from_column_chunk_with_options(
+                &bloom_filter_column(Some(0), Some(111)),
+                &reader,
+                &options
+            )
+            .is_err()
+        );
+        assert_eq!(reader.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_legacy_extended_header_planning() {
+        let mut original = Sbbf::new_with_num_of_bytes(32);
+        original.insert("sketch");
+        let mut serialized = Vec::new();
+        original.write(&mut serialized).unwrap();
+        let (_, header_len) = read_bloom_filter_header_and_length_from_bytes(&serialized).unwrap();
+        // Unknown binary field 5 extends the header well beyond the old estimate.
+        let mut extended = serialized[..header_len as usize - 1].to_vec();
+        extended.extend_from_slice(&[0x18, 64]);
+        extended.extend_from_slice(&[0; 64]);
+        extended.push(0);
+        extended.extend_from_slice(&serialized[header_len as usize..]);
+        let reader = Bytes::from(extended);
+        for length in [None, Some(reader.len() as i32)] {
+            let column = bloom_filter_column(Some(0), length);
+            let filter = Sbbf::read_from_column_chunk(&column, &reader)
+                .unwrap()
+                .unwrap();
+            assert!(filter.check("sketch"));
+        }
+        let options = BloomFilterReadOptions::default().with_max_header_bytes(20);
+        assert!(
+            Sbbf::read_from_column_chunk_with_options(
+                &bloom_filter_column(Some(0), None),
+                &reader,
+                &options
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_header_work_exhaustion_does_not_retry() {
+        let mut header = encode_bloom_filter(32, 0);
+        header.pop();
+        // Unknown Boolean list with i32::MAX elements, but no element payload.
+        header.extend_from_slice(&[0x19, 0xf2, 0xff, 0xff, 0xff, 0xff, 0x07]);
+        header.resize(40, 0);
+        let reader = ScriptedReader::new(
+            1000,
+            vec![Bytes::from(header[..20].to_vec()), Bytes::from(header)],
+        );
+        let err =
+            Sbbf::read_from_column_chunk(&bloom_filter_column(Some(0), None), &reader).unwrap_err();
+        assert!(err.to_string().contains("work limit"));
+        // One incomplete varint prefix, then a resource error; never a bitset fetch.
+        assert_eq!(*reader.requests.lock().unwrap(), [(0, 20), (0, 40)]);
+    }
+
+    #[test]
+    fn test_large_filter_discovers_header_before_bitset() {
+        let serialized = Bytes::from(encode_bloom_filter(128 * 1024, 128 * 1024));
+        let (_, header_len) = read_bloom_filter_header_and_length_from_bytes(&serialized).unwrap();
+        let reader = ScriptedReader::new(
+            serialized.len() as u64,
+            vec![
+                serialized.slice(..20),
+                serialized.slice(header_len as usize..),
+            ],
+        );
+        let column = bloom_filter_column(Some(0), Some(serialized.len() as i32));
+        assert_eq!(
+            Sbbf::read_from_column_chunk(&column, &reader)
+                .unwrap()
+                .unwrap()
+                .num_blocks(),
+            4096
+        );
+        assert_eq!(
+            *reader.requests.lock().unwrap(),
+            [(0, 20), (header_len, 128 * 1024)]
+        );
     }
 
     #[test]
