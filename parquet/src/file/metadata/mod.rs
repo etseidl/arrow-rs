@@ -50,6 +50,8 @@
 //!
 //! [`external_metadata.rs`]: https://github.com/apache/arrow-rs/tree/master/parquet/examples/external_metadata.rs
 //!
+#[cfg(feature = "async")]
+pub mod async_reader;
 #[cfg(feature = "arrow")]
 mod dictionary;
 mod footer_tail;
@@ -92,6 +94,8 @@ use crate::{
     data_type::private::ParquetValueType, file::page_index::offset_index::OffsetIndexMetaData,
 };
 
+#[cfg(feature = "async")]
+pub use async_reader::{MetadataFetch, MetadataSuffixFetch};
 pub use footer_tail::FooterTail;
 pub use options::{ParquetMetaDataOptions, ParquetStatisticsPolicy};
 pub use push_decoder::ParquetMetaDataPushDecoder;
