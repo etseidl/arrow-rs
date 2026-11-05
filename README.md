@@ -35,13 +35,13 @@ There is more information in the [contributing] guide and the [security] policy.
 
 This repository contains the following crates:
 
-| Crate              | Description                                                                  | Latest API Docs                                  | README                            |
-| ------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------- |
-| [`arrow`]          | Core functionality (memory layout, arrays, low level computations)           | [docs.rs](https://docs.rs/arrow/latest)          | [(README)][arrow-readme]          |
-| [`arrow-flight`]   | Support for Arrow-Flight IPC protocol                                        | [docs.rs](https://docs.rs/arrow-flight/latest)   | [(README)][flight-readme]         |
-| [`parquet`]        | Support for the [Apache Parquet] columnar file format                        | [docs.rs](https://docs.rs/parquet/latest)        | [(README)][parquet-readme]        |
-| [`parquet-bloom-filter`] | Standalone Parquet split block Bloom filters | [docs.rs](https://docs.rs/parquet-bloom-filter/latest) | [(README)][parquet-bloom-filter-readme] |
-| [`parquet_derive`] | A crate for deriving RecordWriter/RecordReader for arbitrary, simple structs | [docs.rs](https://docs.rs/parquet-derive/latest) | [(README)][parquet-derive-readme] |
+| Crate                    | Description                                                                  | Latest API Docs                                        | README                                  |
+| ------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------ | --------------------------------------- |
+| [`arrow`]                | Core functionality (memory layout, arrays, low level computations)           | [docs.rs](https://docs.rs/arrow/latest)                | [(README)][arrow-readme]                |
+| [`arrow-flight`]         | Support for Arrow-Flight IPC protocol                                        | [docs.rs](https://docs.rs/arrow-flight/latest)         | [(README)][flight-readme]               |
+| [`parquet`]              | Support for the [Apache Parquet] columnar file format                        | [docs.rs](https://docs.rs/parquet/latest)              | [(README)][parquet-readme]              |
+| [`parquet-bloom-filter`] | Standalone Parquet split block Bloom filters                                 | [docs.rs](https://docs.rs/parquet-bloom-filter/latest) | [(README)][parquet-bloom-filter-readme] |
+| [`parquet_derive`]       | A crate for deriving RecordWriter/RecordReader for arbitrary, simple structs | [docs.rs](https://docs.rs/parquet-derive/latest)       | [(README)][parquet-derive-readme]       |
 
 The current development version the API documentation can be found [here](https://arrow.apache.org/rust).
 
@@ -189,6 +189,5 @@ You can find more details about each crate in their respective READMEs.
 [pull requests]: https://github.com/apache/arrow-rs/pulls
 [discussions]: https://github.com/apache/arrow-rs/discussions
 [security]: SECURITY.md
-
 [`parquet-bloom-filter`]: https://crates.io/crates/parquet-bloom-filter
 [parquet-bloom-filter-readme]: parquet-bloom-filter/README.md
