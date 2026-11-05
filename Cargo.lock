@@ -2607,6 +2607,7 @@ dependencies = [
  "num-traits",
  "object_store",
  "opendal",
+ "parquet-bloom-filter",
  "parquet-geospatial",
  "parquet-variant",
  "parquet-variant-compute",
@@ -2623,6 +2624,13 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-bloom-filter"
+version = "60.1.0"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]

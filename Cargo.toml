@@ -27,6 +27,7 @@ members = [
     "arrow-select",
     "arrow-string",
     "parquet",
+    "parquet-bloom-filter",
     "parquet-geospatial",
     "parquet-variant",
     "parquet-variant-compute",
@@ -85,6 +86,7 @@ arrow-schema = { version = "60.1.0", path = "./arrow-schema" }
 arrow-select = { version = "60.1.0", path = "./arrow-select" }
 arrow-string = { version = "60.1.0", path = "./arrow-string" }
 parquet = { version = "60.1.0", path = "./parquet", default-features = false }
+parquet-bloom-filter = { version = "60.1.0", path = "./parquet-bloom-filter" }
 parquet-geospatial = { version = "60.1.0", path = "./parquet-geospatial" }
 parquet-variant = { version = "60.1.0", path = "./parquet-variant" }
 parquet-variant-json = { version = "60.1.0", path = "./parquet-variant-json" }

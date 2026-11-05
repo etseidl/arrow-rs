@@ -60,6 +60,7 @@ suites:
     - arrow-select/**
     - arrow-string/**
     - parquet/**
+    - parquet-bloom-filter/**
     - parquet_derive/**
     - parquet_derive_test/**
     - parquet-geospatial/**

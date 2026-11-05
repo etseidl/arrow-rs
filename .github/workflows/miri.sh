@@ -29,6 +29,7 @@ CRATES="
     -p arrow-select
     -p arrow-string
     -p parquet
+    -p parquet-bloom-filter
 "
 
 setup_miri() {

@@ -233,6 +233,7 @@ Rust Arrow Crates:
 (cd parquet-variant-json && cargo publish)
 (cd parquet-variant-compute && cargo publish)
 (cd parquet-geospatial && cargo publish)
+(cd parquet-bloom-filter && cargo publish)
 (cd parquet && cargo publish)
 (cd parquet_derive && cargo publish)
 (cd arrow-integration-test && cargo publish)

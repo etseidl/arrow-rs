@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+[package]
+name = "parquet-bloom-filter"
+version = { workspace = true }
+license = { workspace = true }
+description = "Standalone Parquet split block Bloom filters"
+repository = { workspace = true }
+authors = { workspace = true }
+keywords = ["parquet", "bloom-filter"]
+readme = "README.md"
+include = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"] }
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

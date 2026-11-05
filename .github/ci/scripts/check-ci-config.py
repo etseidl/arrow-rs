@@ -255,6 +255,7 @@ class RoutingTests(unittest.TestCase):
             (["arrow-integration-testing/src/lib.rs"], {"arrow", "integration"}),
             (["arrow-pyarrow-testing/src/lib.rs"], {"integration"}),
             (["parquet/src/lib.rs"], {"parquet"}),
+            (["parquet-bloom-filter/src/lib.rs"], {"parquet"}),
             (["parquet_derive/src/lib.rs"], {"parquet"}),
             (["parquet_derive_test/src/lib.rs"], {"parquet"}),
             (["parquet-variant-json/src/lib.rs"], {"parquet"}),

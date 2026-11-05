@@ -36,6 +36,8 @@ jobs:
         run: cargo test -p parquet
       - name: Test --all-features
         run: cargo test -p parquet --all-features
+      - name: Test parquet-bloom-filter
+        run: cargo test -p parquet-bloom-filter
       - name: Test parquet-variant
         run: cargo test -p parquet-variant
       - name: Test parquet-variant-json
@@ -110,6 +112,8 @@ jobs:
         run: cargo check -p parquet --no-default-features --features variant_experimental
       - name: Check compilation --no-default-features --features file_experimental
         run: cargo check -p parquet --no-default-features --features file_experimental
+      - name: Check compilation (parquet-bloom-filter)
+        run: cargo check -p parquet-bloom-filter
       - name: Check compilation (parquet-variant)
         run: cargo check -p parquet-variant
       - name: Check compilation (parquet-variant-json)
@@ -204,6 +208,8 @@ jobs:
         run: rustup component add clippy
       - name: Run clippy
         run: cargo clippy -p parquet --all-targets --all-features -- -D warnings
+      - name: Run clippy (parquet-bloom-filter)
+        run: cargo clippy -p parquet-bloom-filter --all-targets --all-features -- -D warnings
       - name: Run clippy (parquet_derive)
         run: cargo clippy -p parquet_derive --all-features -- -D warnings
       - name: Run clippy (parquet-variant)

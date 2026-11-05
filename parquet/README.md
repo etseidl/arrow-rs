@@ -15,6 +15,10 @@ See the [API documentation](https://docs.rs/parquet/latest) for examples and the
 
 The API documentation for most recent, unreleased code is available [here](https://arrow.apache.org/rust/parquet/index.html).
 
+For standalone split block Bloom filters without Parquet or Arrow dependencies, see
+[`parquet-bloom-filter`](../parquet-bloom-filter/README.md). This crate retains the
+Parquet Bloom filter wrapper with header serialization, file I/O, and `AsBytes` support.
+
 ## Rust Version Compatibility
 
 This crate is tested with the latest stable version of Rust. We do not currently test against other, older versions of the Rust compiler.

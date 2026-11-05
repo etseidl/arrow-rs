@@ -136,6 +136,10 @@ test_source_distribution() {
     cargo publish --dry-run
   popd
 
+  pushd parquet-bloom-filter
+    cargo publish --dry-run
+  popd
+
   # Note can't verify parquet/arrow-flight/parquet-derive until arrow is actually published
   # as they depend on arrow
 

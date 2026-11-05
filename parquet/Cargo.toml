@@ -30,6 +30,7 @@ arrow-data = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 arrow-select = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
+parquet-bloom-filter = { workspace = true }
 parquet-geospatial = { workspace = true, optional = true }
 parquet-variant = { workspace = true, optional = true }
 parquet-variant-compute = { workspace = true, optional = true }
