@@ -84,10 +84,14 @@ impl ChunkReader for File {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
-        // `length` can come from untrusted metadata: don't reserve more than the file holds
-        let available = self.len().saturating_sub(start);
-        let mut buffer =
-            Vec::with_capacity(length.min(usize::try_from(available).unwrap_or(usize::MAX)));
+        // Avoid a file-length query for small reservations; bound larger untrusted lengths.
+        let capacity = if length <= 64 * 1024 {
+            length
+        } else {
+            let available = self.len().saturating_sub(start);
+            length.min(usize::try_from(available).unwrap_or(usize::MAX))
+        };
+        let mut buffer = Vec::with_capacity(capacity);
         let mut reader = self.try_clone()?;
         reader.seek(SeekFrom::Start(start))?;
         let read = reader.take(length as _).read_to_end(&mut buffer)?;
@@ -113,7 +117,7 @@ impl ChunkReader for Bytes {
     type T = bytes::buf::Reader<Bytes>;
 
     fn get_read(&self, start: u64) -> Result<Self::T> {
-        let start = start as usize;
+        let start = usize::try_from(start)?;
         if start > self.len() {
             return Err(eof_err!(
                 "Expected to read at offset {start}, while file has length {}",

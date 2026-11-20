@@ -90,12 +90,14 @@ pub struct SerializedFileReader<R: ChunkReader> {
 /// evaluates to `true` will be scanned
 pub type ReadGroupPredicate = Box<dyn FnMut(&RowGroupMetaData, usize) -> bool>;
 
+type FallibleReadGroupPredicate = Box<dyn FnMut(&RowGroupMetaData, usize) -> Result<bool>>;
+
 /// A builder for [`ReadOptions`].
 /// For the predicates that are added to the builder,
 /// they will be chained using 'AND' to filter the row groups.
 #[derive(Default)]
 pub struct ReadOptionsBuilder {
-    predicates: Vec<ReadGroupPredicate>,
+    predicates: Vec<FallibleReadGroupPredicate>,
     enable_page_index: bool,
     props: Option<ReaderProperties>,
     metadata_options: ParquetMetaDataOptions,
@@ -109,8 +111,9 @@ impl ReadOptionsBuilder {
 
     /// Add a predicate on row group metadata to the reading option,
     /// Filter only row groups that match the predicate criteria
-    pub fn with_predicate(mut self, predicate: ReadGroupPredicate) -> Self {
-        self.predicates.push(predicate);
+    pub fn with_predicate(mut self, mut predicate: ReadGroupPredicate) -> Self {
+        self.predicates
+            .push(Box::new(move |rg, i| Ok(predicate(rg, i))));
         self
     }
 
@@ -123,8 +126,8 @@ impl ReadOptionsBuilder {
     pub fn with_range(mut self, start: i64, end: i64) -> Self {
         assert!(start < end);
         let predicate = move |rg: &RowGroupMetaData, _: usize| {
-            let mid = get_midpoint_offset(rg);
-            mid >= start && mid < end
+            let mid = get_midpoint_offset(rg)?;
+            Ok(mid >= start && mid < end)
         };
         self.predicates.push(Box::new(predicate));
         self
@@ -211,7 +214,7 @@ impl ReadOptionsBuilder {
 /// Predicates are currently only supported on row group metadata.
 /// All predicates will be chained using 'AND' to filter the row groups.
 pub struct ReadOptions {
-    predicates: Vec<ReadGroupPredicate>,
+    predicates: Vec<FallibleReadGroupPredicate>,
     enable_page_index: bool,
     props: ReaderProperties,
     metadata_options: ParquetMetaDataOptions,
@@ -244,7 +247,13 @@ impl<R: 'static + ChunkReader> SerializedFileReader<R> {
 
             // Only clone retained row groups if a predicate rejects a row group.
             for (i, rg_meta) in row_groups.iter().enumerate() {
-                let keep = predicates.iter_mut().all(|predicate| predicate(rg_meta, i));
+                let mut keep = true;
+                for predicate in &mut predicates {
+                    if !predicate(rg_meta, i)? {
+                        keep = false;
+                        break;
+                    }
+                }
                 if !keep {
                     filtered.get_or_insert_with(|| row_groups[..i].to_vec());
                 } else if let Some(kept) = &mut filtered {
@@ -274,15 +283,20 @@ impl<R: 'static + ChunkReader> SerializedFileReader<R> {
 }
 
 /// Get midpoint offset for a row group
-fn get_midpoint_offset(meta: &RowGroupMetaData) -> i64 {
-    let col = meta.column(0);
+fn get_midpoint_offset(meta: &RowGroupMetaData) -> Result<i64> {
+    let col = meta
+        .columns()
+        .first()
+        .ok_or_else(|| general_err!("Cannot compute midpoint of a row group without columns"))?;
     let mut offset = col.data_page_offset();
     if let Some(dic_offset) = col.dictionary_page_offset()
         && offset > dic_offset
     {
         offset = dic_offset
     }
-    offset + meta.compressed_size() / 2
+    offset
+        .checked_add(meta.checked_compressed_size()? / 2)
+        .ok_or_else(|| general_err!("Row group midpoint exceeds i64 range"))
 }
 
 impl<R: 'static + ChunkReader> FileReader for SerializedFileReader<R> {
@@ -409,11 +423,14 @@ pub(crate) fn decode_page(
     // that compression will be applied if decompressor is defined
     let (offset, can_decompress): (usize, bool) = match page_header.data_page_header_v2 {
         Some(ref header_v2) => {
-            if header_v2.definition_levels_byte_length < 0
-                || header_v2.repetition_levels_byte_length < 0
-                || header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length
-                    > page_header.uncompressed_page_size
-            {
+            let levels_byte_length = header_v2
+                .definition_levels_byte_length
+                .checked_add(header_v2.repetition_levels_byte_length);
+            let Some(levels_byte_length) = levels_byte_length.filter(|&length| {
+                header_v2.definition_levels_byte_length >= 0
+                    && header_v2.repetition_levels_byte_length >= 0
+                    && length <= page_header.uncompressed_page_size
+            }) else {
                 return Err(general_err!(
                     "DataPage v2 header contains implausible values \
                         for definition_levels_byte_length ({}) \
@@ -423,12 +440,9 @@ pub(crate) fn decode_page(
                     header_v2.repetition_levels_byte_length,
                     page_header.uncompressed_page_size
                 ));
-            }
+            };
             (
-                usize::try_from(
-                    header_v2.definition_levels_byte_length
-                        + header_v2.repetition_levels_byte_length,
-                )?,
+                usize::try_from(levels_byte_length)?,
                 // When is_compressed flag is missing the page is considered compressed
                 header_v2.is_compressed.unwrap_or(true),
             )
@@ -1084,41 +1098,39 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 next_page_header,
                 page_index,
                 require_dictionary,
-            } => {
-                loop {
-                    if *remaining_bytes == 0 {
-                        return Ok(None);
-                    }
-                    return if let Some(header) = next_page_header.as_ref() {
-                        if let Ok(page_meta) = (&**header).try_into() {
-                            Ok(Some(page_meta))
-                        } else {
-                            // For unknown page type (e.g., INDEX_PAGE), skip and read next.
-                            *next_page_header = None;
-                            continue;
-                        }
-                    } else {
-                        let mut read = self.reader.get_read(*offset)?;
-                        let (header_len, header) = Self::read_page_header_len(
-                            &self.context,
-                            &mut read,
-                            *page_index,
-                            *require_dictionary,
-                        )?;
-                        verify_page_header_len(header_len, *remaining_bytes)?;
-                        *offset += header_len as u64;
-                        *remaining_bytes -= header_len as u64;
-                        let page_meta = if let Ok(page_meta) = (&header).try_into() {
-                            Ok(Some(page_meta))
-                        } else {
-                            // For unknown page type (e.g., INDEX_PAGE), skip and read next.
-                            continue;
-                        };
-                        *next_page_header = Some(Box::new(header));
-                        page_meta
-                    };
+            } => loop {
+                if *remaining_bytes == 0 {
+                    return Ok(None);
                 }
-            }
+                if let Some(header) = next_page_header.as_ref() {
+                    return Ok(Some(PageMetadata::try_from(&**header)?));
+                }
+                let mut read = self.reader.get_read(*offset)?;
+                let (header_len, header) = Self::read_page_header_len(
+                    &self.context,
+                    &mut read,
+                    *page_index,
+                    *require_dictionary,
+                )?;
+                verify_page_header_len(header_len, *remaining_bytes)?;
+                let remaining = *remaining_bytes - header_len as u64;
+                if header.r#type == PageType::INDEX_PAGE {
+                    verify_page_size(
+                        header.compressed_page_size,
+                        header.uncompressed_page_size,
+                        remaining,
+                    )?;
+                    let body_len = header.compressed_page_size as u64;
+                    *offset += header_len as u64 + body_len;
+                    *remaining_bytes = remaining - body_len;
+                    continue;
+                }
+                let page_meta = PageMetadata::try_from(&header)?;
+                *offset += header_len as u64;
+                *remaining_bytes = remaining;
+                *next_page_header = Some(Box::new(header));
+                return Ok(Some(page_meta));
+            },
             SerializedPageReaderState::Pages {
                 page_locations,
                 dictionary_page,
@@ -1199,7 +1211,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     verify_page_size(
                         header.compressed_page_size,
                         header.uncompressed_page_size,
-                        *remaining_bytes,
+                        *remaining_bytes - header_len as u64,
                     )?;
                     let data_page_size = header.compressed_page_size as u64;
                     let is_dict = header.r#type == PageType::DICTIONARY_PAGE;
@@ -2153,7 +2165,7 @@ mod tests {
         // test initial number of row groups
         let metadata = origin_reader.metadata();
         assert_eq!(metadata.num_row_groups(), 1);
-        let mid = get_midpoint_offset(metadata.row_group(0));
+        let mid = get_midpoint_offset(metadata.row_group(0))?;
 
         let test_file = get_test_file("alltypes_plain.parquet");
         let read_options = ReadOptionsBuilder::new().with_range(0, mid + 1).build();
@@ -2175,7 +2187,7 @@ mod tests {
         let test_file = get_test_file("alltypes_tiny_pages.parquet");
         let origin_reader = SerializedFileReader::new(test_file)?;
         let metadata = origin_reader.metadata();
-        let mid = get_midpoint_offset(metadata.row_group(0));
+        let mid = get_midpoint_offset(metadata.row_group(0))?;
 
         // true, true predicate
         let test_file = get_test_file("alltypes_tiny_pages.parquet");
