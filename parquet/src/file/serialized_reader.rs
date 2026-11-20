@@ -680,11 +680,20 @@ impl<R: ChunkReader> SerializedPageReader<R> {
                 // If the offset of the first page doesn't match the start of the column chunk
                 // then the preceding space must contain a dictionary page.
                 let dictionary_page = match locations.first() {
-                    Some(dict_offset) if dict_offset.offset as u64 != start => Some(PageLocation {
-                        offset: start as i64,
-                        compressed_page_size: (dict_offset.offset as u64 - start) as i32,
-                        first_row_index: 0,
-                    }),
+                    Some(first) if first.offset as u64 != start => {
+                        let dictionary_size = u64::try_from(first.offset)
+                            .ok()
+                            .and_then(|offset| offset.checked_sub(start))
+                            .and_then(|size| i32::try_from(size).ok())
+                            .ok_or_else(|| {
+                                general_err!("Invalid first page offset in offset index")
+                            })?;
+                        Some(PageLocation {
+                            offset: start as i64,
+                            compressed_page_size: dictionary_size,
+                            first_row_index: 0,
+                        })
+                    }
                     _ => None,
                 };
 
@@ -1123,13 +1132,22 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         is_dict: true,
                     }))
                 } else if let Some(page) = page_locations.front() {
-                    let next_rows = page_locations
-                        .get(1)
-                        .map(|x| x.first_row_index as usize)
-                        .unwrap_or(*total_rows);
+                    let row_index = |location: &PageLocation| {
+                        usize::try_from(location.first_row_index).map_err(|_| {
+                            general_err!("Invalid page first_row_index in offset index")
+                        })
+                    };
+                    let first_row = row_index(page)?;
+                    let next_rows = match page_locations.get(1) {
+                        Some(next) => row_index(next)?,
+                        None => *total_rows,
+                    };
+                    let num_rows = next_rows.checked_sub(first_row).ok_or_else(|| {
+                        general_err!("Offset index page first_row_index values are not increasing")
+                    })?;
 
                     Ok(Some(PageMetadata {
-                        num_rows: Some(next_rows - page.first_row_index as usize),
+                        num_rows: Some(num_rows),
                         num_levels: None,
                         is_dict: false,
                     }))
@@ -3329,6 +3347,79 @@ mod tests {
                 .unwrap();
 
         assert!(pages.supports_deferred_dictionary());
+    }
+
+    fn page_reader_with_locations(
+        locations: Vec<PageLocation>,
+    ) -> Result<SerializedPageReader<Bytes>> {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let meta = reader.metadata();
+        let total_rows = meta.row_group(0).num_rows() as usize;
+        // No dictionary offset: the chunk starts at the first data page
+        let col_meta = meta
+            .row_group(0)
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_dictionary_page_offset(None)
+            .build()
+            .unwrap();
+        let data_offset = col_meta.data_page_offset();
+        let locations = locations
+            .into_iter()
+            .map(|mut location| {
+                location.offset += data_offset;
+                location
+            })
+            .collect();
+        SerializedPageReader::new(Arc::new(bytes), &col_meta, total_rows, Some(locations))
+    }
+
+    #[test]
+    fn test_peek_page_invalid_offset_index_first_row_index() {
+        let location = |offset, first_row_index| PageLocation {
+            offset,
+            compressed_page_size: 1,
+            first_row_index,
+        };
+        // Well-formed: two pages starting at rows 0 and 2, five rows in total
+        let mut pages = page_reader_with_locations(vec![location(0, 0), location(1, 2)]).unwrap();
+        assert_eq!(pages.peek_next_page().unwrap().unwrap().num_rows, Some(2));
+
+        for first_rows in [[5, 2], [-1, 2], [0, -1]] {
+            let mut pages = page_reader_with_locations(vec![
+                location(0, first_rows[0]),
+                location(1, first_rows[1]),
+            ])
+            .unwrap();
+            assert!(pages.peek_next_page().is_err());
+        }
+
+        // The last page ends at the total row count
+        let mut pages = page_reader_with_locations(vec![location(0, 100)]).unwrap();
+        assert!(pages.peek_next_page().is_err());
+    }
+
+    #[test]
+    fn test_offset_index_first_page_before_column_chunk() {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let col_meta = reader.metadata().row_group(0).column(0).clone();
+        let (start, _) = col_meta.byte_range();
+        assert!(start > 0);
+
+        // A first page location before the start of the column chunk, or negative
+        for offset in [0, start as i64 - 1, -1] {
+            let locations = vec![PageLocation {
+                offset,
+                compressed_page_size: 1,
+                first_row_index: 0,
+            }];
+            SerializedPageReader::new(Arc::new(bytes.clone()), &col_meta, 5, Some(locations))
+                .err()
+                .expect("a first page before the column chunk is invalid");
+        }
     }
 
     /// When the metadata records no dictionary offset, `byte_range()` starts
