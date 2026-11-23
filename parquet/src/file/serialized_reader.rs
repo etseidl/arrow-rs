@@ -409,10 +409,12 @@ pub(crate) fn decode_page(
     // that compression will be applied if decompressor is defined
     let (offset, can_decompress): (usize, bool) = match page_header.data_page_header_v2 {
         Some(ref header_v2) => {
+            let level_bytes = header_v2
+                .definition_levels_byte_length
+                .checked_add(header_v2.repetition_levels_byte_length);
             if header_v2.definition_levels_byte_length < 0
                 || header_v2.repetition_levels_byte_length < 0
-                || header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length
-                    > page_header.uncompressed_page_size
+                || level_bytes.is_none_or(|len| len > page_header.uncompressed_page_size)
             {
                 return Err(general_err!(
                     "DataPage v2 header contains implausible values \
@@ -425,10 +427,7 @@ pub(crate) fn decode_page(
                 ));
             }
             (
-                usize::try_from(
-                    header_v2.definition_levels_byte_length
-                        + header_v2.repetition_levels_byte_length,
-                )?,
+                usize::try_from(level_bytes.unwrap())?,
                 // When is_compressed flag is missing the page is considered compressed
                 header_v2.is_compressed.unwrap_or(true),
             )
@@ -443,7 +442,7 @@ pub(crate) fn decode_page(
                 return Err(general_err!("Invalid page header"));
             }
             let decompressed_size = uncompressed_page_size - offset;
-            let mut decompressed = Vec::with_capacity(uncompressed_page_size);
+            let mut decompressed = Vec::new();
             decompressed.extend_from_slice(&buffer[..offset]);
             // decompressed size of zero corresponds to a page with no non-null values
             // see https://github.com/apache/parquet-format/blob/master/README.md#data-pages
@@ -1300,9 +1299,10 @@ mod tests {
 
     use crate::basic::{self, BoundaryOrder, ColumnOrder, Compression, Encoding, SortOrder};
     use crate::column::reader::ColumnReader;
+    use crate::compression::CodecOptions;
     use crate::data_type::private::ParquetValueType;
     use crate::data_type::{AsBytes, FixedLenByteArrayType, Int32Type};
-    use crate::file::metadata::thrift::DataPageHeaderV2;
+    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2};
     use crate::file::writer::SerializedFileWriter;
     use crate::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
     use crate::record::RowAccessor;
@@ -1339,6 +1339,105 @@ mod tests {
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")
         );
+    }
+
+    #[test]
+    fn test_decode_page_snappy_size_checks() {
+        let mut codec = create_codec(Compression::SNAPPY, &CodecOptions::default())
+            .unwrap()
+            .unwrap();
+        // Matching page and codec declarations still fail the format bound.
+        let mut header = PageHeader {
+            r#type: PageType::DATA_PAGE,
+            uncompressed_page_size: i32::MAX,
+            compressed_page_size: 5,
+            data_page_header: Some(DataPageHeader {
+                num_values: 1,
+                encoding: Encoding::PLAIN,
+                definition_level_encoding: Encoding::RLE,
+                repetition_level_encoding: Encoding::RLE,
+                statistics: None,
+            }),
+            index_page_header: None,
+            dictionary_page_header: None,
+            crc: None,
+            data_page_header_v2: None,
+        };
+        let error = decode_page(
+            header.clone(),
+            Bytes::from_static(&[255, 255, 255, 255, 7]),
+            Type::INT32,
+            Some(&mut codec),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("need at least"));
+
+        // A valid codec payload with an oversized page declaration reaches
+        // the final exact-size check instead.
+        let compressed = Bytes::from_static(&[4, 12, 0, 0, 0, 0]);
+        header.compressed_page_size = compressed.len() as i32;
+        let error = decode_page(header, compressed, Type::INT32, Some(&mut codec)).unwrap_err();
+        assert!(error.to_string().contains("doesn't match the expected"));
+    }
+
+    #[test]
+    fn test_decode_page_v2_prefix_and_compression_modes() {
+        let options = CodecOptions::default();
+        let mut codec = create_codec(Compression::GZIP(Default::default()), &options)
+            .unwrap()
+            .unwrap();
+        let payload = b"values";
+        let prefix = b"levels";
+        let mut compressed = Vec::new();
+        codec.compress(payload, &mut compressed).unwrap();
+        let mut header = PageHeader {
+            r#type: PageType::DATA_PAGE_V2,
+            uncompressed_page_size: (prefix.len() + payload.len()) as i32,
+            compressed_page_size: (prefix.len() + compressed.len()) as i32,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            crc: None,
+            data_page_header_v2: Some(DataPageHeaderV2 {
+                num_nulls: 0,
+                num_rows: 1,
+                num_values: 1,
+                encoding: Encoding::PLAIN,
+                definition_levels_byte_length: prefix.len() as i32,
+                repetition_levels_byte_length: 0,
+                is_compressed: None,
+                statistics: None,
+            }),
+        };
+        let body = Bytes::from([prefix.as_slice(), &compressed].concat());
+        let page = decode_page(header.clone(), body, Type::INT32, Some(&mut codec)).unwrap();
+        assert_eq!(
+            page.buffer().as_ref(),
+            [prefix.as_slice(), payload].concat()
+        );
+
+        // Zero-value suffixes remain valid without a codec payload.
+        header.uncompressed_page_size = prefix.len() as i32;
+        header.compressed_page_size = prefix.len() as i32;
+        header.data_page_header_v2.as_mut().unwrap().num_nulls = 1;
+        let page = decode_page(
+            header.clone(),
+            Bytes::from_static(prefix),
+            Type::INT32,
+            Some(&mut codec),
+        )
+        .unwrap();
+        assert_eq!(page.buffer().as_ref(), prefix);
+
+        // Explicitly uncompressed V2 payloads must not be passed to the codec.
+        header.uncompressed_page_size = (prefix.len() + payload.len()) as i32;
+        header.compressed_page_size = header.uncompressed_page_size;
+        let v2 = header.data_page_header_v2.as_mut().unwrap();
+        v2.num_nulls = 0;
+        v2.is_compressed = Some(false);
+        let plain = Bytes::from([prefix.as_slice(), payload].concat());
+        let page = decode_page(header, plain.clone(), Type::INT32, Some(&mut codec)).unwrap();
+        assert_eq!(page.buffer(), &plain);
     }
 
     #[test]

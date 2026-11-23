@@ -681,7 +681,7 @@ pub(crate) mod private {
     use bytes::Bytes;
 
     use crate::encodings::decoding::PlainDecoderDetails;
-    use crate::util::bit_util::{BitReader, BitWriter, read_num_bytes};
+    use crate::util::bit_util::{BitReader, BitWriter};
 
     use super::{ParquetError, Result, SliceAsBytes};
     use crate::basic::Type;
@@ -887,7 +887,9 @@ pub(crate) mod private {
                     let data = decoder.data.as_ref().expect("set_data should have been called");
                     let num_values = num_values.min(decoder.num_values);
                     let bytes_left = data.len() - decoder.start;
-                    let bytes_to_skip = std::mem::size_of::<Self>() * num_values;
+                    let bytes_to_skip = std::mem::size_of::<Self>()
+                        .checked_mul(num_values)
+                        .ok_or_else(|| eof_err!("Not enough bytes to skip"))?;
 
                     if bytes_left < bytes_to_skip {
                         return Err(eof_err!("Not enough bytes to skip"));
@@ -1003,7 +1005,9 @@ pub(crate) mod private {
                 .expect("set_data should have been called");
             let num_values = std::cmp::min(num_values, decoder.num_values);
             let bytes_left = data.len() - decoder.start;
-            let bytes_to_skip = 12 * num_values;
+            let bytes_to_skip = 12usize
+                .checked_mul(num_values)
+                .ok_or_else(|| eof_err!("Not enough bytes to skip"))?;
 
             if bytes_left < bytes_to_skip {
                 return Err(eof_err!("Not enough bytes to skip"));
@@ -1031,6 +1035,15 @@ pub(crate) mod private {
         }
     }
 
+    /// Returns the range of a complete PLAIN BYTE_ARRAY value, excluding its length prefix.
+    fn plain_byte_array_range(data: &[u8], start: usize) -> Option<std::ops::Range<usize>> {
+        let value_start = start.checked_add(std::mem::size_of::<u32>())?;
+        let prefix = data.get(start..value_start)?;
+        let len = u32::from_le_bytes(prefix.try_into().ok()?) as usize;
+        let value_end = value_start.checked_add(len)?;
+        (value_end <= data.len()).then_some(value_start..value_end)
+    }
+
     impl ParquetValueType for super::ByteArray {
         const PHYSICAL_TYPE: Type = Type::BYTE_ARRAY;
 
@@ -1041,7 +1054,7 @@ pub(crate) mod private {
             _: &mut BitWriter,
         ) -> Result<()> {
             for value in values {
-                let len: u32 = value.len().try_into().unwrap();
+                let len: u32 = value.len().try_into()?;
                 writer.write_all(&len.to_ne_bytes())?;
                 let raw = value.data();
                 writer.write_all(raw)?;
@@ -1064,16 +1077,10 @@ pub(crate) mod private {
                 .expect("set_data should have been called");
             let num_values = std::cmp::min(buffer.len(), decoder.num_values);
             for val_array in buffer.iter_mut().take(num_values) {
-                let len: usize =
-                    read_num_bytes::<u32>(4, data.slice(decoder.start..).as_ref()) as usize;
-                decoder.start += std::mem::size_of::<u32>();
-
-                if data.len() < decoder.start + len {
-                    return Err(eof_err!("Not enough bytes to decode"));
-                }
-
-                val_array.set_data(data.slice(decoder.start..decoder.start + len));
-                decoder.start += len;
+                let value = plain_byte_array_range(data, decoder.start)
+                    .ok_or_else(|| eof_err!("Not enough bytes to decode"))?;
+                decoder.start = value.end;
+                val_array.set_data(data.slice(value));
             }
             decoder.num_values -= num_values;
 
@@ -1092,9 +1099,9 @@ pub(crate) mod private {
             let num_values = num_values.min(decoder.num_values);
 
             for _ in 0..num_values {
-                let len: usize =
-                    read_num_bytes::<u32>(4, data.slice(decoder.start..).as_ref()) as usize;
-                decoder.start += std::mem::size_of::<u32>() + len;
+                let value = plain_byte_array_range(data, decoder.start)
+                    .ok_or_else(|| eof_err!("Not enough bytes to skip"))?;
+                decoder.start = value.end;
             }
             decoder.num_values -= num_values;
 
@@ -1156,7 +1163,12 @@ pub(crate) mod private {
 
         #[inline]
         fn decode(buffer: &mut [Self], decoder: &mut PlainDecoderDetails) -> Result<usize> {
-            assert!(decoder.type_length > 0);
+            if decoder.type_length <= 0 {
+                return Err(general_err!(
+                    "Invalid FIXED_LEN_BYTE_ARRAY length: {}",
+                    decoder.type_length
+                ));
+            }
 
             let data = decoder
                 .data
@@ -1167,7 +1179,7 @@ pub(crate) mod private {
             for item in buffer.iter_mut().take(num_values) {
                 let len = decoder.type_length as usize;
 
-                if data.len() < decoder.start + len {
+                if data.len() - decoder.start < len {
                     return Err(eof_err!("Not enough bytes to decode"));
                 }
 
@@ -1180,7 +1192,12 @@ pub(crate) mod private {
         }
 
         fn skip(decoder: &mut PlainDecoderDetails, num_values: usize) -> Result<usize> {
-            assert!(decoder.type_length > 0);
+            if decoder.type_length <= 0 {
+                return Err(general_err!(
+                    "Invalid FIXED_LEN_BYTE_ARRAY length: {}",
+                    decoder.type_length
+                ));
+            }
 
             let data = decoder
                 .data
@@ -1190,7 +1207,7 @@ pub(crate) mod private {
             for _ in 0..num_values {
                 let len = decoder.type_length as usize;
 
-                if data.len() < decoder.start + len {
+                if data.len() - decoder.start < len {
                     return Err(eof_err!("Not enough bytes to skip"));
                 }
 
@@ -1372,6 +1389,75 @@ macro_rules! ensure_phys_ty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encodings::decoding::{Decoder, PlainDecoder};
+
+    #[test]
+    fn test_plain_byte_array_truncated_page() {
+        // The second value has either a partial length prefix or a short payload.
+        for malformed in [vec![1, 0], vec![3, 0, 0, 0, b'a', b'b']] {
+            let mut page = vec![3, 0, 0, 0, b'a', b'b', b'c'];
+            page.extend_from_slice(&malformed);
+            let page = Bytes::from(page);
+            let mut decoder = PlainDecoder::<ByteArrayType>::new(0);
+            decoder.set_data(page.clone(), 2).unwrap();
+            let mut out = [ByteArray::new(), ByteArray::new()];
+            assert!(matches!(decoder.get(&mut out), Err(ParquetError::EOF(_))));
+            assert_eq!(out[0].data(), b"abc");
+            assert_eq!(decoder.values_left(), 2);
+            assert!(matches!(
+                decoder.get(&mut out[..1]),
+                Err(ParquetError::EOF(_))
+            ));
+
+            let mut decoder = PlainDecoder::<ByteArrayType>::new(0);
+            decoder.set_data(page, 2).unwrap();
+            assert!(matches!(decoder.skip(2), Err(ParquetError::EOF(_))));
+            assert_eq!(decoder.values_left(), 2);
+            assert!(matches!(decoder.skip(1), Err(ParquetError::EOF(_))));
+        }
+    }
+
+    #[test]
+    fn test_plain_byte_array_skip_and_decode_empty_value() {
+        let page =
+            Bytes::from_static(&[3, 0, 0, 0, b'a', b'b', b'c', 0, 0, 0, 0, 1, 0, 0, 0, b'z']);
+        let mut decoder = PlainDecoder::<ByteArrayType>::new(0);
+        decoder.set_data(page.clone(), 3).unwrap();
+        let mut out = [ByteArray::new()];
+        assert_eq!(decoder.skip(1).unwrap(), 1);
+        assert_eq!(decoder.get(&mut out).unwrap(), 1);
+        assert_eq!(out[0].data(), b"");
+        assert_eq!(decoder.get(&mut out).unwrap(), 1);
+        assert_eq!(out[0].data(), b"z");
+        assert_eq!(decoder.values_left(), 0);
+
+        decoder.set_data(page, 3).unwrap();
+        assert_eq!(decoder.skip(2).unwrap(), 2);
+        assert_eq!(decoder.get(&mut out).unwrap(), 1);
+        assert_eq!(out[0].data(), b"z");
+    }
+
+    #[test]
+    fn test_plain_fixed_len_byte_array_invalid_width() {
+        for width in [0, -1] {
+            let mut decoder = PlainDecoder::<FixedLenByteArrayType>::new(width);
+            decoder.set_data(Bytes::from_static(b"a"), 1).unwrap();
+            let mut output = [FixedLenByteArray::default()];
+            let error = decoder.get(&mut output).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid FIXED_LEN_BYTE_ARRAY length")
+            );
+            let error = decoder.skip(1).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid FIXED_LEN_BYTE_ARRAY length")
+            );
+            assert_eq!(decoder.values_left(), 1);
+        }
+    }
 
     #[test]
     fn test_as_bytes() {

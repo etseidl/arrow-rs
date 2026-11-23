@@ -1032,12 +1032,11 @@ impl BitReader {
     pub fn skip(&mut self, num_values: usize, num_bits: usize) -> usize {
         debug_assert!(num_bits <= 64);
 
-        let needed_bits = num_bits * num_values;
         let remaining_bits = (self.buffer.len() - self.byte_offset) * 8 - self.bit_offset;
 
-        let values_to_read = match remaining_bits < needed_bits {
-            true => remaining_bits / num_bits,
-            false => num_values,
+        let values_to_read = match num_bits.checked_mul(num_values) {
+            Some(needed_bits) if needed_bits <= remaining_bits => num_values,
+            _ => remaining_bits / num_bits,
         };
 
         let end_bit_offset = self.byte_offset * 8 + values_to_read * num_bits + self.bit_offset;
@@ -1290,6 +1289,13 @@ mod tests {
         assert_eq!(bit_reader.get_value::<i32>(4), Some(0));
         let skipped = bit_reader.skip(1, 1);
         assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn test_bit_reader_skip_large_count_preserves_trailing_bit() {
+        let mut bit_reader = BitReader::from(vec![255, 0]);
+        assert_eq!(bit_reader.skip(usize::MAX, 3), 5);
+        assert_eq!(bit_reader.get_value::<u32>(1), Some(0));
     }
 
     #[test]

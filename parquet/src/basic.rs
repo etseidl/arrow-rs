@@ -708,12 +708,14 @@ fn split_compression_string(str_setting: &str) -> Result<(&str, Option<i32>), Pa
 
     match split_setting {
         Some((codec, level_str)) => {
-            let level = &level_str[..level_str.len() - 1]
+            let invalid_level =
+                || ParquetError::General(format!("invalid compression level: {level_str}"));
+            let level = level_str
+                .strip_suffix(')')
+                .ok_or_else(invalid_level)?
                 .parse::<i32>()
-                .map_err(|_| {
-                    ParquetError::General(format!("invalid compression level: {level_str}"))
-                })?;
-            Ok((codec, Some(*level)))
+                .map_err(|_| invalid_level())?;
+            Ok((codec, Some(level)))
         }
         None => Ok((str_setting, None)),
     }
@@ -2368,6 +2370,13 @@ mod tests {
             err.to_string(),
             "Parquet error: unknown encoding: gzip(-10)"
         );
+    }
+
+    #[test]
+    fn test_parse_compression_malformed_level() {
+        for setting in ["GZIP(", "GZIP(é", "GZIP(6x"] {
+            assert!(setting.parse::<Compression>().is_err(), "{setting}");
+        }
     }
 
     #[test]
